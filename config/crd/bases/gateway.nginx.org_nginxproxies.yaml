@@ -3,7 +3,7 @@ apiVersion: apiextensions.k8s.io/v1
 kind: CustomResourceDefinition
 metadata:
   annotations:
-    controller-gen.kubebuilder.io/version: v0.20.1
+    controller-gen.kubebuilder.io/version: v0.21.0
   name: nginxproxies.gateway.nginx.org
 spec:
   group: gateway.nginx.org
@@ -51,6 +51,156 @@ spec:
           spec:
             description: Spec defines the desired state of the NginxProxy.
             properties:
+              compression:
+                description: |-
+                  Compression defines the configuration for HTTP response compression.
+                  When set, NGINX compresses responses for clients that support it,
+                  reducing bandwidth usage.
+                properties:
+                  buffers:
+                    description: |-
+                      Buffers sets the number and size of buffers used to compress a response.
+
+                      NGINX directive: https://nginx.org/en/docs/http/ngx_http_gzip_module.html#gzip_buffers
+                    properties:
+                      number:
+                        description: Number sets the number of buffers.
+                        format: int32
+                        maximum: 256
+                        minimum: 1
+                        type: integer
+                      size:
+                        description: Size sets the size of each buffer.
+                        pattern: ^\d{1,4}(k|m|g)?$
+                        type: string
+                    required:
+                    - number
+                    - size
+                    type: object
+                  gzip:
+                    description: Gzip defines gzip module-specific compression settings.
+                    properties:
+                      disable:
+                        description: |-
+                          Disable specifies regular expressions to match User-Agent headers of requests
+                          that should not be gzip-compressed.
+
+                          NGINX directive: https://nginx.org/en/docs/http/ngx_http_gzip_module.html#gzip_disable
+                        items:
+                          type: string
+                        maxItems: 16
+                        minItems: 1
+                        type: array
+                      httpVersion:
+                        description: |-
+                          HTTPVersion sets the minimum HTTP version of a request required to compress a response.
+
+                          NGINX directive: https://nginx.org/en/docs/http/ngx_http_gzip_module.html#gzip_http_version
+                        enum:
+                        - "1.0"
+                        - "1.1"
+                        type: string
+                      proxied:
+                        description: |-
+                          Proxied enables or disables gzip compression for proxied requests depending on the request and response.
+                          Accepted values are: "off", "expired", "no-cache", "no-store", "private", "no_last_modified",
+                          "no_etag", "auth", "any".
+                          Multiple values can be specified.
+
+                          NGINX directive: https://nginx.org/en/docs/http/ngx_http_gzip_module.html#gzip_proxied
+                        items:
+                          description: GzipProxiedType defines the conditions under
+                            which responses from proxied requests are compressed.
+                          enum:
+                          - "off"
+                          - expired
+                          - no-cache
+                          - no-store
+                          - private
+                          - no_last_modified
+                          - no_etag
+                          - auth
+                          - any
+                          type: string
+                        maxItems: 9
+                        minItems: 1
+                        type: array
+                      vary:
+                        description: |-
+                          Vary enables or disables inserting the "Vary: Accept-Encoding" response header
+                          when gzip compression is active.
+
+                          NGINX directive: https://nginx.org/en/docs/http/ngx_http_gzip_module.html#gzip_vary
+                        type: boolean
+                    type: object
+                  level:
+                    description: |-
+                      Level sets the compression level.
+                      Higher values provide better compression but use more CPU.
+
+                      NGINX directive: https://nginx.org/en/docs/http/ngx_http_gzip_module.html#gzip_comp_level
+                    format: int32
+                    maximum: 9
+                    minimum: 1
+                    type: integer
+                  mimeTypes:
+                    description: |-
+                      MimeTypes specifies the MIME types to compress in addition to "text/html".
+                      "text/html" is always compressed when compression is enabled.
+                      Wildcards like "text/*" are not supported by NGINX.
+                      Example: ["application/json", "text/css", "application/javascript"]
+
+                      NGINX directive: https://nginx.org/en/docs/http/ngx_http_gzip_module.html#gzip_types
+                    items:
+                      type: string
+                    maxItems: 32
+                    minItems: 1
+                    type: array
+                  minLength:
+                    description: |-
+                      MinLength sets the minimum length of a response that will be compressed.
+                      The length is determined from the "Content-Length" response header field.
+
+                      NGINX directive: https://nginx.org/en/docs/http/ngx_http_gzip_module.html#gzip_min_length
+                    format: int32
+                    minimum: 0
+                    type: integer
+                  type:
+                    description: |-
+                      Type specifies the compression algorithm to use.
+                      Currently only gzip is supported.
+                    enum:
+                    - gzip
+                    type: string
+                required:
+                - type
+                type: object
+                x-kubernetes-validations:
+                - message: type 'gzip' requires spec.compression.gzip to be set
+                  rule: '!(self.type == ''gzip'' && !has(self.gzip))'
+              disableBaseHeaders:
+                description: |-
+                  DisableBaseHeaders specifies which default X-* base headers should be omitted
+                  from being added to the base proxy_set_header directives in the NGINX configuration.
+                  This allows users to set these headers themselves without NGF overriding them.
+
+                  Supported values are limited to X-* base headers and "*".
+                  A value of "*" disables all X-* base headers.
+                items:
+                  description: |-
+                    BaseHeaderName is the name of a base X-* header that can be disabled
+                    from being added to the base proxy_set_header directives in the NGINX configuration.
+                  enum:
+                  - '*'
+                  - X-Forwarded-For
+                  - X-Forwarded-Proto
+                  - X-Forwarded-Host
+                  - X-Forwarded-Port
+                  - X-Real-IP
+                  type: string
+                maxItems: 6
+                type: array
+                x-kubernetes-list-type: set
               disableHTTP2:
                 description: |-
                   DisableHTTP2 defines if http2 should be disabled for all servers.
@@ -2710,7 +2860,7 @@ spec:
                                     A failure to resolve or pull the image during pod startup will block containers from starting and may add significant latency. Failures will be retried using normal volume backoff and will be reported on the pod reason and message.
                                     The types of objects that may be mounted by this volume are defined by the container runtime implementation on a host machine and at minimum must include all valid types supported by the container image field.
                                     The OCI object gets mounted in a single directory (spec.containers[*].volumeMounts.mountPath) by merging the manifest layers in the same way as for container images.
-                                    The volume will be mounted read-only (ro) and non-executable files (noexec).
+                                    The volume will be mounted read-only (ro).
                                     Sub path mounts for containers are not supported (spec.containers[*].volumeMounts.subpath) before 1.33.
                                     The field spec.securityContext.fsGroupChangePolicy has no effect on this volume type.
                                   properties:
@@ -2884,8 +3034,7 @@ spec:
                                   description: |-
                                     portworxVolume represents a portworx volume attached and mounted on kubelets host machine.
                                     Deprecated: PortworxVolume is deprecated. All operations for the in-tree portworxVolume type
-                                    are redirected to the pxd.portworx.com CSI driver when the CSIMigrationPortworx feature-gate
-                                    is on.
+                                    are redirected to the pxd.portworx.com CSI driver.
                                   properties:
                                     fsType:
                                       description: |-
@@ -3715,6 +3864,322 @@ spec:
                               - name
                               type: object
                             type: array
+                        type: object
+                      wafContainers:
+                        description: |-
+                          WAFContainers defines container specifications for NGINX App Protect WAF v5 containers.
+                          These containers are only deployed when WAF is enabled in the NginxProxy spec.
+                        properties:
+                          configManager:
+                            description: |-
+                              ConfigManager defines the configuration for the WAF configuration manager container.
+                              This container manages policy configuration and communication with the enforcer.
+                            properties:
+                              image:
+                                description: Image is the container image to use for
+                                  this WAF container.
+                                properties:
+                                  pullPolicy:
+                                    default: IfNotPresent
+                                    description: PullPolicy describes a policy for
+                                      if/when to pull a container image.
+                                    enum:
+                                    - Always
+                                    - Never
+                                    - IfNotPresent
+                                    type: string
+                                  repository:
+                                    description: |-
+                                      Repository is the image path.
+                                      Default is ghcr.io/nginx/nginx-gateway-fabric/nginx.
+                                    type: string
+                                  tag:
+                                    description: Tag is the image tag to use. Default
+                                      matches the tag of the control plane.
+                                    type: string
+                                type: object
+                              resources:
+                                description: Resources describes the compute resource
+                                  requirements for this WAF container.
+                                properties:
+                                  claims:
+                                    description: |-
+                                      Claims lists the names of resources, defined in spec.resourceClaims,
+                                      that are used by this container.
+
+                                      This field depends on the
+                                      DynamicResourceAllocation feature gate.
+
+                                      This field is immutable. It can only be set for containers.
+                                    items:
+                                      description: ResourceClaim references one entry
+                                        in PodSpec.ResourceClaims.
+                                      properties:
+                                        name:
+                                          description: |-
+                                            Name must match the name of one entry in pod.spec.resourceClaims of
+                                            the Pod where this field is used. It makes that resource available
+                                            inside a container.
+                                          type: string
+                                        request:
+                                          description: |-
+                                            Request is the name chosen for a request in the referenced claim.
+                                            If empty, everything from the claim is made available, otherwise
+                                            only the result of this request.
+                                          type: string
+                                      required:
+                                      - name
+                                      type: object
+                                    type: array
+                                    x-kubernetes-list-map-keys:
+                                    - name
+                                    x-kubernetes-list-type: map
+                                  limits:
+                                    additionalProperties:
+                                      anyOf:
+                                      - type: integer
+                                      - type: string
+                                      pattern: ^(\+|-)?(([0-9]+(\.[0-9]*)?)|(\.[0-9]+))(([KMGTPE]i)|[numkMGTPE]|([eE](\+|-)?(([0-9]+(\.[0-9]*)?)|(\.[0-9]+))))?$
+                                      x-kubernetes-int-or-string: true
+                                    description: |-
+                                      Limits describes the maximum amount of compute resources allowed.
+                                      More info: https://kubernetes.io/docs/concepts/configuration/manage-resources-containers/
+                                    type: object
+                                  requests:
+                                    additionalProperties:
+                                      anyOf:
+                                      - type: integer
+                                      - type: string
+                                      pattern: ^(\+|-)?(([0-9]+(\.[0-9]*)?)|(\.[0-9]+))(([KMGTPE]i)|[numkMGTPE]|([eE](\+|-)?(([0-9]+(\.[0-9]*)?)|(\.[0-9]+))))?$
+                                      x-kubernetes-int-or-string: true
+                                    description: |-
+                                      Requests describes the minimum amount of compute resources required.
+                                      If Requests is omitted for a container, it defaults to Limits if that is explicitly specified,
+                                      otherwise to an implementation-defined value. Requests cannot exceed Limits.
+                                      More info: https://kubernetes.io/docs/concepts/configuration/manage-resources-containers/
+                                    type: object
+                                type: object
+                              volumeMounts:
+                                description: VolumeMounts describe the mounting of
+                                  Volumes within the WAF container.
+                                items:
+                                  description: VolumeMount describes a mounting of
+                                    a Volume within a container.
+                                  properties:
+                                    mountPath:
+                                      description: |-
+                                        Path within the container at which the volume should be mounted.  Must
+                                        not contain ':'.
+                                      type: string
+                                    mountPropagation:
+                                      description: |-
+                                        mountPropagation determines how mounts are propagated from the host
+                                        to container and the other way around.
+                                        When not set, MountPropagationNone is used.
+                                        This field is beta in 1.10.
+                                        When RecursiveReadOnly is set to IfPossible or to Enabled, MountPropagation must be None or unspecified
+                                        (which defaults to None).
+                                      type: string
+                                    name:
+                                      description: This must match the Name of a Volume.
+                                      type: string
+                                    readOnly:
+                                      description: |-
+                                        Mounted read-only if true, read-write otherwise (false or unspecified).
+                                        Defaults to false.
+                                      type: boolean
+                                    recursiveReadOnly:
+                                      description: |-
+                                        RecursiveReadOnly specifies whether read-only mounts should be handled
+                                        recursively.
+
+                                        If ReadOnly is false, this field has no meaning and must be unspecified.
+
+                                        If ReadOnly is true, and this field is set to Disabled, the mount is not made
+                                        recursively read-only.  If this field is set to IfPossible, the mount is made
+                                        recursively read-only, if it is supported by the container runtime.  If this
+                                        field is set to Enabled, the mount is made recursively read-only if it is
+                                        supported by the container runtime, otherwise the pod will not be started and
+                                        an error will be generated to indicate the reason.
+
+                                        If this field is set to IfPossible or Enabled, MountPropagation must be set to
+                                        None (or be unspecified, which defaults to None).
+
+                                        If this field is not specified, it is treated as an equivalent of Disabled.
+                                      type: string
+                                    subPath:
+                                      description: |-
+                                        Path within the volume from which the container's volume should be mounted.
+                                        Defaults to "" (volume's root).
+                                      type: string
+                                    subPathExpr:
+                                      description: |-
+                                        Expanded path within the volume from which the container's volume should be mounted.
+                                        Behaves similarly to SubPath but environment variable references $(VAR_NAME) are expanded using the container's environment.
+                                        Defaults to "" (volume's root).
+                                        SubPathExpr and SubPath are mutually exclusive.
+                                      type: string
+                                  required:
+                                  - mountPath
+                                  - name
+                                  type: object
+                                type: array
+                            type: object
+                          enforcer:
+                            description: |-
+                              Enforcer defines the configuration for the WAF enforcer container.
+                              This container performs the actual WAF enforcement and policy application.
+                            properties:
+                              image:
+                                description: Image is the container image to use for
+                                  this WAF container.
+                                properties:
+                                  pullPolicy:
+                                    default: IfNotPresent
+                                    description: PullPolicy describes a policy for
+                                      if/when to pull a container image.
+                                    enum:
+                                    - Always
+                                    - Never
+                                    - IfNotPresent
+                                    type: string
+                                  repository:
+                                    description: |-
+                                      Repository is the image path.
+                                      Default is ghcr.io/nginx/nginx-gateway-fabric/nginx.
+                                    type: string
+                                  tag:
+                                    description: Tag is the image tag to use. Default
+                                      matches the tag of the control plane.
+                                    type: string
+                                type: object
+                              resources:
+                                description: Resources describes the compute resource
+                                  requirements for this WAF container.
+                                properties:
+                                  claims:
+                                    description: |-
+                                      Claims lists the names of resources, defined in spec.resourceClaims,
+                                      that are used by this container.
+
+                                      This field depends on the
+                                      DynamicResourceAllocation feature gate.
+
+                                      This field is immutable. It can only be set for containers.
+                                    items:
+                                      description: ResourceClaim references one entry
+                                        in PodSpec.ResourceClaims.
+                                      properties:
+                                        name:
+                                          description: |-
+                                            Name must match the name of one entry in pod.spec.resourceClaims of
+                                            the Pod where this field is used. It makes that resource available
+                                            inside a container.
+                                          type: string
+                                        request:
+                                          description: |-
+                                            Request is the name chosen for a request in the referenced claim.
+                                            If empty, everything from the claim is made available, otherwise
+                                            only the result of this request.
+                                          type: string
+                                      required:
+                                      - name
+                                      type: object
+                                    type: array
+                                    x-kubernetes-list-map-keys:
+                                    - name
+                                    x-kubernetes-list-type: map
+                                  limits:
+                                    additionalProperties:
+                                      anyOf:
+                                      - type: integer
+                                      - type: string
+                                      pattern: ^(\+|-)?(([0-9]+(\.[0-9]*)?)|(\.[0-9]+))(([KMGTPE]i)|[numkMGTPE]|([eE](\+|-)?(([0-9]+(\.[0-9]*)?)|(\.[0-9]+))))?$
+                                      x-kubernetes-int-or-string: true
+                                    description: |-
+                                      Limits describes the maximum amount of compute resources allowed.
+                                      More info: https://kubernetes.io/docs/concepts/configuration/manage-resources-containers/
+                                    type: object
+                                  requests:
+                                    additionalProperties:
+                                      anyOf:
+                                      - type: integer
+                                      - type: string
+                                      pattern: ^(\+|-)?(([0-9]+(\.[0-9]*)?)|(\.[0-9]+))(([KMGTPE]i)|[numkMGTPE]|([eE](\+|-)?(([0-9]+(\.[0-9]*)?)|(\.[0-9]+))))?$
+                                      x-kubernetes-int-or-string: true
+                                    description: |-
+                                      Requests describes the minimum amount of compute resources required.
+                                      If Requests is omitted for a container, it defaults to Limits if that is explicitly specified,
+                                      otherwise to an implementation-defined value. Requests cannot exceed Limits.
+                                      More info: https://kubernetes.io/docs/concepts/configuration/manage-resources-containers/
+                                    type: object
+                                type: object
+                              volumeMounts:
+                                description: VolumeMounts describe the mounting of
+                                  Volumes within the WAF container.
+                                items:
+                                  description: VolumeMount describes a mounting of
+                                    a Volume within a container.
+                                  properties:
+                                    mountPath:
+                                      description: |-
+                                        Path within the container at which the volume should be mounted.  Must
+                                        not contain ':'.
+                                      type: string
+                                    mountPropagation:
+                                      description: |-
+                                        mountPropagation determines how mounts are propagated from the host
+                                        to container and the other way around.
+                                        When not set, MountPropagationNone is used.
+                                        This field is beta in 1.10.
+                                        When RecursiveReadOnly is set to IfPossible or to Enabled, MountPropagation must be None or unspecified
+                                        (which defaults to None).
+                                      type: string
+                                    name:
+                                      description: This must match the Name of a Volume.
+                                      type: string
+                                    readOnly:
+                                      description: |-
+                                        Mounted read-only if true, read-write otherwise (false or unspecified).
+                                        Defaults to false.
+                                      type: boolean
+                                    recursiveReadOnly:
+                                      description: |-
+                                        RecursiveReadOnly specifies whether read-only mounts should be handled
+                                        recursively.
+
+                                        If ReadOnly is false, this field has no meaning and must be unspecified.
+
+                                        If ReadOnly is true, and this field is set to Disabled, the mount is not made
+                                        recursively read-only.  If this field is set to IfPossible, the mount is made
+                                        recursively read-only, if it is supported by the container runtime.  If this
+                                        field is set to Enabled, the mount is made recursively read-only if it is
+                                        supported by the container runtime, otherwise the pod will not be started and
+                                        an error will be generated to indicate the reason.
+
+                                        If this field is set to IfPossible or Enabled, MountPropagation must be set to
+                                        None (or be unspecified, which defaults to None).
+
+                                        If this field is not specified, it is treated as an equivalent of Disabled.
+                                      type: string
+                                    subPath:
+                                      description: |-
+                                        Path within the volume from which the container's volume should be mounted.
+                                        Defaults to "" (volume's root).
+                                      type: string
+                                    subPathExpr:
+                                      description: |-
+                                        Expanded path within the volume from which the container's volume should be mounted.
+                                        Behaves similarly to SubPath but environment variable references $(VAR_NAME) are expanded using the container's environment.
+                                        Defaults to "" (volume's root).
+                                        SubPathExpr and SubPath are mutually exclusive.
+                                      type: string
+                                  required:
+                                  - mountPath
+                                  - name
+                                  type: object
+                                type: array
+                            type: object
                         type: object
                     type: object
                   deployment:
@@ -6969,7 +7434,7 @@ spec:
                                     A failure to resolve or pull the image during pod startup will block containers from starting and may add significant latency. Failures will be retried using normal volume backoff and will be reported on the pod reason and message.
                                     The types of objects that may be mounted by this volume are defined by the container runtime implementation on a host machine and at minimum must include all valid types supported by the container image field.
                                     The OCI object gets mounted in a single directory (spec.containers[*].volumeMounts.mountPath) by merging the manifest layers in the same way as for container images.
-                                    The volume will be mounted read-only (ro) and non-executable files (noexec).
+                                    The volume will be mounted read-only (ro).
                                     Sub path mounts for containers are not supported (spec.containers[*].volumeMounts.subpath) before 1.33.
                                     The field spec.securityContext.fsGroupChangePolicy has no effect on this volume type.
                                   properties:
@@ -7143,8 +7608,7 @@ spec:
                                   description: |-
                                     portworxVolume represents a portworx volume attached and mounted on kubelets host machine.
                                     Deprecated: PortworxVolume is deprecated. All operations for the in-tree portworxVolume type
-                                    are redirected to the pxd.portworx.com CSI driver when the CSIMigrationPortworx feature-gate
-                                    is on.
+                                    are redirected to the pxd.portworx.com CSI driver.
                                   properties:
                                     fsType:
                                       description: |-
@@ -7975,10 +8439,364 @@ spec:
                               type: object
                             type: array
                         type: object
+                      podDisruptionBudget:
+                        description: |-
+                          PodDisruptionBudget is the configuration for limiting the number of concurrent disruptions of a pod.
+                          A PodDisruptionBudget is created when this field is set.
+                        properties:
+                          maxUnavailable:
+                            anyOf:
+                            - type: integer
+                            - type: string
+                            description: |-
+                              MaxUnavailable is the maximum number of pods that can be unavailable after an eviction.
+                              Value can be an absolute number (e.g. 1) or a percentage of desired pods (e.g. 50%).
+                              Mutually exclusive with MinAvailable.
+                            x-kubernetes-int-or-string: true
+                          minAvailable:
+                            anyOf:
+                            - type: integer
+                            - type: string
+                            description: |-
+                              MinAvailable is the minimum number of pods that must be available after an eviction.
+                              Value can be an absolute number (e.g. 1) or a percentage of desired pods (e.g. 50%).
+                              Mutually exclusive with MaxUnavailable.
+                            x-kubernetes-int-or-string: true
+                          unhealthyPodEvictionPolicy:
+                            description: |-
+                              UnhealthyPodEvictionPolicy defines when unhealthy pods should be considered for eviction.
+                              Valid values are IfHealthyBudget and AlwaysAllow.
+                              Defaults to IfHealthyBudget if not set.
+                            enum:
+                            - IfHealthyBudget
+                            - AlwaysAllow
+                            type: string
+                        type: object
+                        x-kubernetes-validations:
+                        - message: exactly one of minAvailable or maxUnavailable must
+                            be set
+                          rule: (has(self.minAvailable) && !has(self.maxUnavailable))
+                            || (!has(self.minAvailable) && has(self.maxUnavailable))
                       replicas:
                         description: Number of desired Pods.
                         format: int32
                         type: integer
+                      wafContainers:
+                        description: |-
+                          WAFContainers defines container specifications for NGINX App Protect WAF v5 containers.
+                          These containers are only deployed when WAF is enabled in the NginxProxy spec.
+                        properties:
+                          configManager:
+                            description: |-
+                              ConfigManager defines the configuration for the WAF configuration manager container.
+                              This container manages policy configuration and communication with the enforcer.
+                            properties:
+                              image:
+                                description: Image is the container image to use for
+                                  this WAF container.
+                                properties:
+                                  pullPolicy:
+                                    default: IfNotPresent
+                                    description: PullPolicy describes a policy for
+                                      if/when to pull a container image.
+                                    enum:
+                                    - Always
+                                    - Never
+                                    - IfNotPresent
+                                    type: string
+                                  repository:
+                                    description: |-
+                                      Repository is the image path.
+                                      Default is ghcr.io/nginx/nginx-gateway-fabric/nginx.
+                                    type: string
+                                  tag:
+                                    description: Tag is the image tag to use. Default
+                                      matches the tag of the control plane.
+                                    type: string
+                                type: object
+                              resources:
+                                description: Resources describes the compute resource
+                                  requirements for this WAF container.
+                                properties:
+                                  claims:
+                                    description: |-
+                                      Claims lists the names of resources, defined in spec.resourceClaims,
+                                      that are used by this container.
+
+                                      This field depends on the
+                                      DynamicResourceAllocation feature gate.
+
+                                      This field is immutable. It can only be set for containers.
+                                    items:
+                                      description: ResourceClaim references one entry
+                                        in PodSpec.ResourceClaims.
+                                      properties:
+                                        name:
+                                          description: |-
+                                            Name must match the name of one entry in pod.spec.resourceClaims of
+                                            the Pod where this field is used. It makes that resource available
+                                            inside a container.
+                                          type: string
+                                        request:
+                                          description: |-
+                                            Request is the name chosen for a request in the referenced claim.
+                                            If empty, everything from the claim is made available, otherwise
+                                            only the result of this request.
+                                          type: string
+                                      required:
+                                      - name
+                                      type: object
+                                    type: array
+                                    x-kubernetes-list-map-keys:
+                                    - name
+                                    x-kubernetes-list-type: map
+                                  limits:
+                                    additionalProperties:
+                                      anyOf:
+                                      - type: integer
+                                      - type: string
+                                      pattern: ^(\+|-)?(([0-9]+(\.[0-9]*)?)|(\.[0-9]+))(([KMGTPE]i)|[numkMGTPE]|([eE](\+|-)?(([0-9]+(\.[0-9]*)?)|(\.[0-9]+))))?$
+                                      x-kubernetes-int-or-string: true
+                                    description: |-
+                                      Limits describes the maximum amount of compute resources allowed.
+                                      More info: https://kubernetes.io/docs/concepts/configuration/manage-resources-containers/
+                                    type: object
+                                  requests:
+                                    additionalProperties:
+                                      anyOf:
+                                      - type: integer
+                                      - type: string
+                                      pattern: ^(\+|-)?(([0-9]+(\.[0-9]*)?)|(\.[0-9]+))(([KMGTPE]i)|[numkMGTPE]|([eE](\+|-)?(([0-9]+(\.[0-9]*)?)|(\.[0-9]+))))?$
+                                      x-kubernetes-int-or-string: true
+                                    description: |-
+                                      Requests describes the minimum amount of compute resources required.
+                                      If Requests is omitted for a container, it defaults to Limits if that is explicitly specified,
+                                      otherwise to an implementation-defined value. Requests cannot exceed Limits.
+                                      More info: https://kubernetes.io/docs/concepts/configuration/manage-resources-containers/
+                                    type: object
+                                type: object
+                              volumeMounts:
+                                description: VolumeMounts describe the mounting of
+                                  Volumes within the WAF container.
+                                items:
+                                  description: VolumeMount describes a mounting of
+                                    a Volume within a container.
+                                  properties:
+                                    mountPath:
+                                      description: |-
+                                        Path within the container at which the volume should be mounted.  Must
+                                        not contain ':'.
+                                      type: string
+                                    mountPropagation:
+                                      description: |-
+                                        mountPropagation determines how mounts are propagated from the host
+                                        to container and the other way around.
+                                        When not set, MountPropagationNone is used.
+                                        This field is beta in 1.10.
+                                        When RecursiveReadOnly is set to IfPossible or to Enabled, MountPropagation must be None or unspecified
+                                        (which defaults to None).
+                                      type: string
+                                    name:
+                                      description: This must match the Name of a Volume.
+                                      type: string
+                                    readOnly:
+                                      description: |-
+                                        Mounted read-only if true, read-write otherwise (false or unspecified).
+                                        Defaults to false.
+                                      type: boolean
+                                    recursiveReadOnly:
+                                      description: |-
+                                        RecursiveReadOnly specifies whether read-only mounts should be handled
+                                        recursively.
+
+                                        If ReadOnly is false, this field has no meaning and must be unspecified.
+
+                                        If ReadOnly is true, and this field is set to Disabled, the mount is not made
+                                        recursively read-only.  If this field is set to IfPossible, the mount is made
+                                        recursively read-only, if it is supported by the container runtime.  If this
+                                        field is set to Enabled, the mount is made recursively read-only if it is
+                                        supported by the container runtime, otherwise the pod will not be started and
+                                        an error will be generated to indicate the reason.
+
+                                        If this field is set to IfPossible or Enabled, MountPropagation must be set to
+                                        None (or be unspecified, which defaults to None).
+
+                                        If this field is not specified, it is treated as an equivalent of Disabled.
+                                      type: string
+                                    subPath:
+                                      description: |-
+                                        Path within the volume from which the container's volume should be mounted.
+                                        Defaults to "" (volume's root).
+                                      type: string
+                                    subPathExpr:
+                                      description: |-
+                                        Expanded path within the volume from which the container's volume should be mounted.
+                                        Behaves similarly to SubPath but environment variable references $(VAR_NAME) are expanded using the container's environment.
+                                        Defaults to "" (volume's root).
+                                        SubPathExpr and SubPath are mutually exclusive.
+                                      type: string
+                                  required:
+                                  - mountPath
+                                  - name
+                                  type: object
+                                type: array
+                            type: object
+                          enforcer:
+                            description: |-
+                              Enforcer defines the configuration for the WAF enforcer container.
+                              This container performs the actual WAF enforcement and policy application.
+                            properties:
+                              image:
+                                description: Image is the container image to use for
+                                  this WAF container.
+                                properties:
+                                  pullPolicy:
+                                    default: IfNotPresent
+                                    description: PullPolicy describes a policy for
+                                      if/when to pull a container image.
+                                    enum:
+                                    - Always
+                                    - Never
+                                    - IfNotPresent
+                                    type: string
+                                  repository:
+                                    description: |-
+                                      Repository is the image path.
+                                      Default is ghcr.io/nginx/nginx-gateway-fabric/nginx.
+                                    type: string
+                                  tag:
+                                    description: Tag is the image tag to use. Default
+                                      matches the tag of the control plane.
+                                    type: string
+                                type: object
+                              resources:
+                                description: Resources describes the compute resource
+                                  requirements for this WAF container.
+                                properties:
+                                  claims:
+                                    description: |-
+                                      Claims lists the names of resources, defined in spec.resourceClaims,
+                                      that are used by this container.
+
+                                      This field depends on the
+                                      DynamicResourceAllocation feature gate.
+
+                                      This field is immutable. It can only be set for containers.
+                                    items:
+                                      description: ResourceClaim references one entry
+                                        in PodSpec.ResourceClaims.
+                                      properties:
+                                        name:
+                                          description: |-
+                                            Name must match the name of one entry in pod.spec.resourceClaims of
+                                            the Pod where this field is used. It makes that resource available
+                                            inside a container.
+                                          type: string
+                                        request:
+                                          description: |-
+                                            Request is the name chosen for a request in the referenced claim.
+                                            If empty, everything from the claim is made available, otherwise
+                                            only the result of this request.
+                                          type: string
+                                      required:
+                                      - name
+                                      type: object
+                                    type: array
+                                    x-kubernetes-list-map-keys:
+                                    - name
+                                    x-kubernetes-list-type: map
+                                  limits:
+                                    additionalProperties:
+                                      anyOf:
+                                      - type: integer
+                                      - type: string
+                                      pattern: ^(\+|-)?(([0-9]+(\.[0-9]*)?)|(\.[0-9]+))(([KMGTPE]i)|[numkMGTPE]|([eE](\+|-)?(([0-9]+(\.[0-9]*)?)|(\.[0-9]+))))?$
+                                      x-kubernetes-int-or-string: true
+                                    description: |-
+                                      Limits describes the maximum amount of compute resources allowed.
+                                      More info: https://kubernetes.io/docs/concepts/configuration/manage-resources-containers/
+                                    type: object
+                                  requests:
+                                    additionalProperties:
+                                      anyOf:
+                                      - type: integer
+                                      - type: string
+                                      pattern: ^(\+|-)?(([0-9]+(\.[0-9]*)?)|(\.[0-9]+))(([KMGTPE]i)|[numkMGTPE]|([eE](\+|-)?(([0-9]+(\.[0-9]*)?)|(\.[0-9]+))))?$
+                                      x-kubernetes-int-or-string: true
+                                    description: |-
+                                      Requests describes the minimum amount of compute resources required.
+                                      If Requests is omitted for a container, it defaults to Limits if that is explicitly specified,
+                                      otherwise to an implementation-defined value. Requests cannot exceed Limits.
+                                      More info: https://kubernetes.io/docs/concepts/configuration/manage-resources-containers/
+                                    type: object
+                                type: object
+                              volumeMounts:
+                                description: VolumeMounts describe the mounting of
+                                  Volumes within the WAF container.
+                                items:
+                                  description: VolumeMount describes a mounting of
+                                    a Volume within a container.
+                                  properties:
+                                    mountPath:
+                                      description: |-
+                                        Path within the container at which the volume should be mounted.  Must
+                                        not contain ':'.
+                                      type: string
+                                    mountPropagation:
+                                      description: |-
+                                        mountPropagation determines how mounts are propagated from the host
+                                        to container and the other way around.
+                                        When not set, MountPropagationNone is used.
+                                        This field is beta in 1.10.
+                                        When RecursiveReadOnly is set to IfPossible or to Enabled, MountPropagation must be None or unspecified
+                                        (which defaults to None).
+                                      type: string
+                                    name:
+                                      description: This must match the Name of a Volume.
+                                      type: string
+                                    readOnly:
+                                      description: |-
+                                        Mounted read-only if true, read-write otherwise (false or unspecified).
+                                        Defaults to false.
+                                      type: boolean
+                                    recursiveReadOnly:
+                                      description: |-
+                                        RecursiveReadOnly specifies whether read-only mounts should be handled
+                                        recursively.
+
+                                        If ReadOnly is false, this field has no meaning and must be unspecified.
+
+                                        If ReadOnly is true, and this field is set to Disabled, the mount is not made
+                                        recursively read-only.  If this field is set to IfPossible, the mount is made
+                                        recursively read-only, if it is supported by the container runtime.  If this
+                                        field is set to Enabled, the mount is made recursively read-only if it is
+                                        supported by the container runtime, otherwise the pod will not be started and
+                                        an error will be generated to indicate the reason.
+
+                                        If this field is set to IfPossible or Enabled, MountPropagation must be set to
+                                        None (or be unspecified, which defaults to None).
+
+                                        If this field is not specified, it is treated as an equivalent of Disabled.
+                                      type: string
+                                    subPath:
+                                      description: |-
+                                        Path within the volume from which the container's volume should be mounted.
+                                        Defaults to "" (volume's root).
+                                      type: string
+                                    subPathExpr:
+                                      description: |-
+                                        Expanded path within the volume from which the container's volume should be mounted.
+                                        Behaves similarly to SubPath but environment variable references $(VAR_NAME) are expanded using the container's environment.
+                                        Defaults to "" (volume's root).
+                                        SubPathExpr and SubPath are mutually exclusive.
+                                      type: string
+                                  required:
+                                  - mountPath
+                                  - name
+                                  type: object
+                                type: array
+                            type: object
+                        type: object
                     type: object
                   service:
                     description: Service is the configuration for the NGINX Service.
@@ -7987,8 +8805,7 @@ spec:
                         default: Local
                         description: |-
                           ExternalTrafficPolicy describes how nodes distribute service traffic they
-                          receive on one of the Service's "externally-facing" addresses (NodePorts, ExternalIPs,
-                          and LoadBalancer IPs).
+                          receive on one of the Service's "externally-facing" addresses (NodePorts and LoadBalancer IPs).
                         enum:
                         - Cluster
                         - Local
@@ -8105,7 +8922,11 @@ spec:
                           Format specifies the custom log format string.
                           If not specified, NGINX default 'combined' format is used.
                           For now only path /dev/stdout can be used.
+                          Single quotes and line breaks are not allowed because the format is
+                          rendered inside a single-quoted NGINX log_format directive.
                           See https://nginx.org/en/docs/http/ngx_http_log_module.html#log_format
+                        maxLength: 4096
+                        pattern: ^[^'\x0A\x0D]*$
                         type: string
                     type: object
                   agentLevel:
@@ -8137,7 +8958,24 @@ spec:
                     - alert
                     - emerg
                     type: string
+                  errorLogFormat:
+                    description: |-
+                      ErrorLogFormat controls the output format of the NGINX error_log directive.
+                      Set to 'json' to enable JSON-formatted error logs for NGINX Plus only and
+                      cannot be combined with errorLevel: debug.
+                      When set to 'json', NGINX Gateway Fabric also emits a JSON-formatted access log
+                      if the user has not supplied a custom access log format.
+                      See https://nginx.org/en/docs/ngx_core_module.html#error_log
+                    enum:
+                    - default
+                    - json
+                    type: string
                 type: object
+                x-kubernetes-validations:
+                - message: JSON-formatted error logs are not supported when errorLevel
+                    is debug
+                  rule: '!(has(self.errorLogFormat) && self.errorLogFormat == ''json''
+                    && has(self.errorLevel) && self.errorLevel == ''debug'')'
               metrics:
                 description: |-
                   Metrics defines the configuration for Prometheus scraping metrics. Changing this value results in a
@@ -8258,6 +9096,8 @@ spec:
                   See: https://nginx.org/en/docs/http/ngx_http_core_module.html#server_tokens
                   NGINX directive: https://nginx.org/en/docs/http/ngx_http_core_module.html#server_tokens
                   Default is "off".
+                maxLength: 255
+                pattern: ^([^"\\\x0A\x0D]|\\[^\x0A\x0D])*$
                 type: string
               telemetry:
                 description: Telemetry specifies the OpenTelemetry configuration.
@@ -8305,7 +9145,7 @@ spec:
                   serviceName:
                     description: |-
                       ServiceName is the "service.name" attribute of the OpenTelemetry resource.
-                      Default is 'ngf:<gateway-namespace>:<gateway-name>'. If a value is provided by the user,
+                      Default is 'ngf:gateway-namespace:gateway-name'. If a value is provided by the user,
                       then the default becomes a prefix to that value.
                     maxLength: 127
                     pattern: ^[a-zA-Z0-9_-]+$
@@ -8342,6 +9182,34 @@ spec:
                     x-kubernetes-list-map-keys:
                     - key
                     x-kubernetes-list-type: map
+                type: object
+              waf:
+                description: WAF configures NGINX App Protect WAF functionality.
+                properties:
+                  bundleFailOpen:
+                    description: |-
+                      BundleFailOpen controls the behavior when a WAF policy bundle (policy or log profile)
+                      has not yet been successfully fetched. When set to true, NGINX configuration is pushed
+                      and traffic is served without WAF protection until the bundle becomes available. When
+                      false (the default), the configuration push is withheld until the bundle is fetched,
+                      maintaining a fail-closed posture.
+                    type: boolean
+                  disableCookieSeed:
+                    description: |-
+                      DisableCookieSeed disables the app_protect_cookie_seed directive.
+                      By default, NGF sets this directive to a stable value derived from the Gateway UID,
+                      ensuring WAF session cookies are consistent across multiple NGINX replicas.
+                      Set this to true if you have pre-compiled the cookie seed into your WAF policy bundles
+                      via the compiler global settings, to avoid conflicting with the compiled-in value.
+                      Default is false.
+                    type: boolean
+                  enable:
+                    description: |-
+                      Enable enables NGINX App Protect WAF functionality.
+                      When enabled, NGINX Gateway Fabric will deploy additional WAF containers
+                      (waf-enforcer and waf-config-mgr) alongside the main NGINX container.
+                      Default is false.
+                    type: boolean
                 type: object
               workerConnections:
                 description: |-

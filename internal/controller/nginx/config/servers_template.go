@@ -173,8 +173,19 @@ server {
         auth_basic_user_file {{ $l.AuthBasic.File }};
         {{- end }}
 
-        {{- if $l.AuthOIDCProviderName }}
-        auth_oidc {{ $l.AuthOIDCProviderName }};
+        {{- if $l.AuthOIDC }}
+        {{- if $l.AuthOIDC.ProviderName }}
+        auth_oidc {{ $l.AuthOIDC.ProviderName }};
+            {{- if $l.AuthOIDC.AuthZConfig }}
+        auth_jwt "" token=$oidc_id_token;
+                {{- if $l.AuthOIDC.AuthZConfig.AuthRequire }}
+        auth_jwt_require {{ $l.AuthOIDC.AuthZConfig.AuthRequire }};
+                {{- end }}
+                {{- range $l.AuthOIDC.AuthZConfig.ProxySetHeaders }}
+        proxy_set_header {{ .Name }} {{ .Value }};
+                {{- end }}
+            {{- end }}
+        {{- end }}
         {{- end }}
 
         {{- if $l.AuthJWT }}
@@ -186,6 +197,35 @@ server {
             {{- end }}
             {{- if $l.AuthJWT.KeyCache }}
         auth_jwt_key_cache {{ $l.AuthJWT.KeyCache }};
+            {{- end }}
+            {{- if $l.AuthJWT.Leeway }}
+        auth_jwt_leeway {{ $l.AuthJWT.Leeway }};
+            {{- end }}
+            {{- if $l.AuthJWT.AuthZConfig }}
+                {{- if $l.AuthJWT.AuthZConfig.AuthRequire }}
+        auth_jwt_require {{ $l.AuthJWT.AuthZConfig.AuthRequire }};
+                {{- end }}
+                {{- range $l.AuthJWT.AuthZConfig.ProxySetHeaders }}
+        proxy_set_header {{ .Name }} {{ .Value }};
+                {{- end }}
+            {{- end }}
+        {{- end }}
+
+        {{- if $l.CORSHeaders }}
+        if ($request_method = OPTIONS) {
+            return 200;
+        }
+        {{- end }}
+
+        {{- if $l.ClientMaxBodySize }}
+        client_max_body_size {{ $l.ClientMaxBodySize }};
+        {{- end }}
+
+        {{- if and $l.AuthExternalRequest $l.AuthExternalRequest.InternalPath }}
+        auth_request {{ $l.AuthExternalRequest.InternalPath }};
+            {{- range $h := $l.AuthExternalRequest.AllowedResponseHeaders }}
+        auth_request_set {{ extAuthResponseVar $h }} {{ upstreamHTTPVar $h }};
+        proxy_set_header {{ $h }} {{ extAuthResponseVar $h }};
             {{- end }}
         {{- end }}
 
@@ -219,10 +259,6 @@ server {
         add_header {{ $h.Name }} "{{ $h.Value }}" always;
                 {{- end }}
             {{- end }}
-
-        if ($request_method = OPTIONS) {
-            return 200;
-        }
         {{- end }}
 
         {{- if eq $l.Type "redirect" -}}
@@ -244,12 +280,23 @@ server {
         include /etc/nginx/grpc-error-pages.conf;
         {{- end }}
 
-        proxy_http_version 1.1;
+        {{- if $l.ProxyHTTPVersion }}
+        proxy_http_version {{ $l.ProxyHTTPVersion }};
+        {{- end }}
         {{- if $l.ProxyPass -}}
             {{ range $h := $l.ProxySetHeaders }}
         {{ $proxyOrGRPC }}_set_header {{ $h.Name }} "{{ $h.Value }}";
             {{- end }}
         {{ $proxyOrGRPC }}_pass {{ $l.ProxyPass }};
+            {{- if $l.ProxyPassRequestBody }}
+        proxy_pass_request_body {{ $l.ProxyPassRequestBody }};
+                {{- if eq $l.ProxyPassRequestBody "off" }}
+        proxy_set_header Content-Length "";
+                {{- end }}
+            {{- end }}
+            {{- if $l.ProxyPassRequestHeaders }}
+        proxy_pass_request_headers {{ $l.ProxyPassRequestHeaders }};
+            {{- end }}
             {{ range $h := $l.ResponseHeaders.Add }}
         add_header {{ $h.Name }} "{{ $h.Value }}" always;
             {{- end }}
@@ -282,14 +329,14 @@ server {
     {{- end }}
 {{ end }}
 server {
-    listen unix:/var/run/nginx/nginx-503-server.sock;
+    listen ` + SocketBasePath + `nginx-503-server.sock;
     access_log off;
 
     return 503;
 }
 
 server {
-    listen unix:/var/run/nginx/nginx-500-server.sock;
+    listen ` + SocketBasePath + `nginx-500-server.sock;
     access_log off;
 
     return 500;

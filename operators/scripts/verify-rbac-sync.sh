@@ -53,12 +53,16 @@ fi
 
 # Render Helm chart with ALL features enabled to get maximum set of permissions
 echo "Rendering Helm chart with all features enabled..."
+kube_version=$(grep 'kubeVersion' "$HELM_CHART_DIR/Chart.yaml" | grep -Eo '[0-9]+\.[0-9]+\.[0-9]+')
+
 HELM_RENDERED=$(helm template test "$HELM_CHART_DIR" \
+    --kube-version "${kube_version}" \
     --set nginxGateway.gwAPIExperimentalFeatures.enable=true \
     --set nginxGateway.gwAPIInferenceExtension.enable=true \
     --set nginxGateway.snippets.enable=true \
     --set nginxGateway.leaderElection.enable=true \
     --set nginxGateway.productTelemetry.enable=true \
+    --set nginxGateway.plmStorage.url=https://my-release-f5-waf-seaweed-filer.plm-namespace.svc.cluster.local:9333 \
     --set nginx.plus=true \
     2>/dev/null)
 

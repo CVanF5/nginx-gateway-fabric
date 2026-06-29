@@ -125,12 +125,12 @@ func TestExecuteUpstreams_NginxOSS(t *testing.T) {
 		"upstream up6-usp-keepAlive-connections-zero": 1,
 		"upstream invalid-backend-ref":                1,
 
-		"server 10.0.0.0:80;":                               1,
-		"server 11.0.0.0:80;":                               1,
-		"server [2001:db8::1]:80":                           1,
-		"server 12.0.0.0:80;":                               1,
-		"server 12.0.0.6:80;":                               1,
-		"server unix:/var/run/nginx/nginx-503-server.sock;": 1,
+		"server 10.0.0.0:80;":     1,
+		"server 11.0.0.0:80;":     1,
+		"server [2001:db8::1]:80": 1,
+		"server 12.0.0.0:80;":     1,
+		"server 12.0.0.6:80;":     1,
+		fmt.Sprintf("server %snginx-503-server.sock;", SocketBasePath): 1,
 
 		"keepalive 1;":           1,
 		"keepalive_requests 1;":  2,
@@ -145,8 +145,8 @@ func TestExecuteUpstreams_NginxOSS(t *testing.T) {
 		"zone up5-usp 2m;":    1,
 		"zone up6-usp-keepAlive-connections-zero 2m;": 1,
 
-		"random two least_conn;": 5,
-		"keepalive 16;":          4,
+		defaultLBMethod + ";": 5,
+		"keepalive 16;":       4,
 	}
 
 	upstreams := gen.createUpstreams(stateUpstreams, upstreamsettings.NewProcessor())
@@ -339,9 +339,9 @@ func TestExecuteUpstreams_NginxPlus(t *testing.T) {
 		"upstream up9-usp-keepAlive-connections-zero": 1,
 		"upstream invalid-backend-ref":                1,
 
-		"random two least_conn;": 9,
-		"ip_hash;":               1,
-		"keepalive 16;":          8,
+		defaultLBMethod + ";": 9,
+		"ip_hash;":            1,
+		"keepalive 16;":       8,
 
 		"zone up1 1m;":                                1,
 		"zone up2 1m;":                                1,
@@ -372,7 +372,7 @@ func TestExecuteUpstreams_NginxPlus(t *testing.T) {
 		"state /var/lib/nginx/state/up7-with-sp.conf;":                        1,
 		"state /var/lib/nginx/state/up8-with-sp-expiry-and-path-empty.conf;":  1,
 		"state /var/lib/nginx/state/up9-usp-keepAlive-connections-zero.conf;": 1,
-		"server unix:/var/run/nginx/nginx-500-server.sock;":                   1,
+		fmt.Sprintf("server %snginx-500-server.sock;", SocketBasePath):        1,
 	}
 
 	upstreams := gen.createUpstreams(stateUpstreams, upstreamsettings.NewProcessor())
@@ -1702,9 +1702,9 @@ func TestExecuteUpstreams_LoadBalancingMethod(t *testing.T) {
 		{
 			name: "default load balancing method",
 			expectedSubStrings: map[string]int{
-				"upstream up1-usp-ipv4":  1,
-				"upstream up2-usp-ipv6":  1,
-				"random two least_conn;": 2,
+				"upstream up1-usp-ipv4": 1,
+				"upstream up2-usp-ipv6": 1,
+				defaultLBMethod + ";":   2,
 			},
 		},
 		{

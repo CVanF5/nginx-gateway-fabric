@@ -4,13 +4,15 @@ import (
 	"context"
 	"errors"
 	"fmt"
-	"net"
 	"sync"
 	"time"
 
 	"github.com/go-logr/logr"
 	v1 "k8s.io/api/core/v1"
+	apierrors "k8s.io/apimachinery/pkg/api/errors"
+	apimeta "k8s.io/apimachinery/pkg/api/meta"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
 	"k8s.io/apimachinery/pkg/types"
 	"k8s.io/apimachinery/pkg/util/intstr"
 	"k8s.io/apimachinery/pkg/util/wait"
@@ -27,6 +29,7 @@ import (
 	ngxConfig "github.com/nginx/nginx-gateway-fabric/v2/internal/controller/nginx/config"
 	"github.com/nginx/nginx-gateway-fabric/v2/internal/controller/provisioner"
 	"github.com/nginx/nginx-gateway-fabric/v2/internal/controller/state"
+	"github.com/nginx/nginx-gateway-fabric/v2/internal/controller/state/conditions"
 	"github.com/nginx/nginx-gateway-fabric/v2/internal/controller/state/dataplane"
 	"github.com/nginx/nginx-gateway-fabric/v2/internal/controller/state/graph"
 	"github.com/nginx/nginx-gateway-fabric/v2/internal/controller/state/resolver"
@@ -34,6 +37,9 @@ import (
 	"github.com/nginx/nginx-gateway-fabric/v2/internal/framework/controller"
 	"github.com/nginx/nginx-gateway-fabric/v2/internal/framework/events"
 	"github.com/nginx/nginx-gateway-fabric/v2/internal/framework/helpers"
+	"github.com/nginx/nginx-gateway-fabric/v2/internal/framework/kinds"
+	"github.com/nginx/nginx-gateway-fabric/v2/internal/framework/waf/fetch"
+	wafPoller "github.com/nginx/nginx-gateway-fabric/v2/internal/framework/waf/poller"
 )
 
 type handlerMetricsCollector interface {
@@ -71,6 +77,8 @@ type eventHandlerConfig struct {
 	statusQueue *status.Queue
 	// nginxDeployments contains a map of all nginx Deployments, and data about them.
 	nginxDeployments *agent.DeploymentStore
+	// wafPollerManager manages WAF bundle polling for policies with polling enabled.
+	wafPollerManager wafPoller.Manager
 	// logger is the logger for the event handler.
 	logger logr.Logger
 	// gatewayPodConfig contains information about this Pod.
@@ -87,6 +95,11 @@ type eventHandlerConfig struct {
 	plus bool
 	// InferenceExtension indicates if Gateway API Inference Extension support is enabled.
 	inferenceExtension bool
+	// plmEnabled indicates whether PLM storage is configured. When false, AP resource
+	// reconciliation (finalizer management, listing) is skipped — APPolicy/APLogConf are
+	// only relevant for PLM-sourced WAFPolicies, and the corresponding RBAC permissions
+	// in the Helm chart are gated on the same condition.
+	plmEnabled bool
 }
 
 const (
@@ -94,7 +107,34 @@ const (
 	groupAllExceptGateways = "all-graphs-except-gateways"
 	groupGateways          = "gateways"
 	groupControlPlane      = "control-plane"
+
+	// apResourceFinalizer prevents deletion of AP resources that are still referenced by WAFPolicy.
+	apResourceFinalizer = "gateway.nginx.org/ap-policy-protection"
 )
+
+type apResourceType int
+
+const (
+	apResourceTypePolicy apResourceType = iota
+	apResourceTypeLogConf
+)
+
+type apResourceKey struct {
+	nsName       types.NamespacedName
+	resourceType apResourceType
+}
+
+// String implements fmt.Stringer so apResourceType values render as a human-readable kind in logs.
+func (t apResourceType) String() string {
+	switch t {
+	case apResourceTypePolicy:
+		return kinds.APPolicy
+	case apResourceTypeLogConf:
+		return kinds.APLogConf
+	default:
+		panic(fmt.Sprintf("unknown apResourceType: %d", t))
+	}
+}
 
 // filterKey is the `kind_namespace_name" of an object being filtered.
 type filterKey string
@@ -114,16 +154,15 @@ type objectFilter struct {
 // (3) Updating control plane configuration.
 // (4) Tracks the NGINX Plus usage reporting Secret (if applicable).
 type eventHandlerImpl struct {
-	// latestConfigurations are the latest Configuration generation for each Gateway tree.
-	latestConfigurations map[types.NamespacedName]*dataplane.Configuration
-
-	// objectFilters contains all created objectFilters, with the key being a filterKey
-	objectFilters map[filterKey]objectFilter
-
-	cfg        eventHandlerConfig
-	lock       sync.RWMutex
-	leaderLock sync.RWMutex
-	leader     bool
+	latestConfigurations  map[types.NamespacedName]*dataplane.Configuration
+	objectFilters         map[filterKey]objectFilter
+	finalizedAPResources  map[apResourceKey]struct{}
+	cfg                   eventHandlerConfig
+	lock                  sync.RWMutex
+	leaderLock            sync.RWMutex
+	finalizerLock         sync.Mutex
+	finalizersInitialized bool
+	leader                bool
 }
 
 // newEventHandlerImpl creates a new eventHandlerImpl.
@@ -131,6 +170,7 @@ func newEventHandlerImpl(cfg eventHandlerConfig) *eventHandlerImpl {
 	handler := &eventHandlerImpl{
 		cfg:                  cfg,
 		latestConfigurations: make(map[types.NamespacedName]*dataplane.Configuration),
+		finalizedAPResources: make(map[apResourceKey]struct{}),
 	}
 
 	handler.objectFilters = map[filterKey]objectFilter{
@@ -163,7 +203,7 @@ func (h *eventHandlerImpl) HandleEventBatch(ctx context.Context, logger logr.Log
 		h.parseAndCaptureEvent(ctx, logger, event)
 	}
 
-	gr := h.cfg.processor.Process()
+	gr := h.cfg.processor.Process(ctx)
 
 	// Once we've processed resources on startup and built our first graph, mark the Pod as ready.
 	if !h.cfg.graphBuiltHealthChecker.ready {
@@ -187,6 +227,12 @@ func (h *eventHandlerImpl) sendNginxConfig(ctx context.Context, logger logr.Logg
 	if gr == nil {
 		return
 	}
+
+	// Reconcile WAF bundle pollers on every graph update, regardless of Gateway state.
+	// This ensures pollers for deleted or orphaned policies are stopped even on early returns.
+	defer h.reconcileWAFPollers(ctx, gr)
+
+	h.reconcileAPResourceFinalizers(ctx, logger, gr)
 
 	if len(gr.Gateways) == 0 {
 		// still need to update GatewayClass status
@@ -215,6 +261,22 @@ func (h *eventHandlerImpl) sendNginxConfig(ctx context.Context, logger logr.Logg
 					GatewayName:    gw.Source.GetName(),
 				},
 				UpdateType: status.UpdateAll,
+			}
+			h.cfg.statusQueue.Enqueue(obj)
+			continue
+		}
+
+		if gatewayHasPendingWAFBundle(gr, gw) && !graph.WAFBundleFailOpenForNginxProxy(gw.EffectiveNginxProxy) {
+			// Fail-closed (default): a pending bundle blocks the config push until the bundle is available.
+			// Enqueue a status update because the config is being withheld in this fail-closed case,
+			// making the pending condition visible to the operator.
+			obj := &status.QueueObject{
+				UpdateType: status.UpdateAll,
+				Deployment: status.Deployment{
+					NamespacedName: gw.DeploymentName,
+					GatewayName:    gw.Source.GetName(),
+				},
+				Error: errors.New("NGINX configuration update withheld: WAF bundle for Gateway is still pending"),
 			}
 			h.cfg.statusQueue.Enqueue(obj)
 			continue
@@ -262,14 +324,207 @@ func (h *eventHandlerImpl) sendNginxConfig(ctx context.Context, logger logr.Logg
 		err := errors.Join(configErr, upstreamErr)
 
 		obj := &status.QueueObject{
-			UpdateType: status.UpdateAll,
-			Error:      err,
+			UpdateType:        status.UpdateAll,
+			Error:             err,
+			NginxConfigPushed: true,
 			Deployment: status.Deployment{
 				NamespacedName: gw.DeploymentName,
 				GatewayName:    gw.Source.GetName(),
 			},
 		}
 		h.cfg.statusQueue.Enqueue(obj)
+	}
+}
+
+// reconcileWAFPollers starts, updates, or stops WAF bundle pollers based on the current graph state.
+// For each valid WAFPolicy with polling enabled, a poller is started.
+// For policies that are deleted or no longer have polling enabled, the poller is stopped.
+func (h *eventHandlerImpl) reconcileWAFPollers(ctx context.Context, gr *graph.Graph) {
+	if h.cfg.wafPollerManager == nil {
+		return
+	}
+
+	activePolicies := make(map[types.NamespacedName]struct{})
+
+	for key, policy := range gr.NGFPolicies {
+		if key.GVK.Kind != kinds.WAFPolicy {
+			continue
+		}
+
+		wafPolicy, ok := policy.Source.(*ngfAPI.WAFPolicy)
+		if !ok {
+			continue
+		}
+
+		// PLM policies use event-driven watches, not polling.
+		if wafPolicy.Spec.Type == ngfAPI.PolicySourceTypePLM {
+			continue
+		}
+
+		if !policy.Valid {
+			// Invalid policy - stop any existing poller.
+			h.cfg.wafPollerManager.StopPoller(key.NsName)
+			continue
+		}
+
+		// Build bundle sources (only includes sources with polling enabled).
+		var resolvedAuth *fetch.BundleAuth
+		var resolvedTLSCA []byte
+		if policy.WAFState != nil {
+			resolvedAuth = policy.WAFState.ResolvedAuth
+			resolvedTLSCA = policy.WAFState.ResolvedTLSCA
+		}
+
+		sources := wafPoller.BuildBundleSources(key.NsName, wafPolicy.Spec, resolvedAuth, resolvedTLSCA)
+		if len(sources) == 0 {
+			// No sources with polling enabled - stop any existing poller.
+			h.cfg.wafPollerManager.StopPoller(key.NsName)
+			continue
+		}
+
+		// Determine target deployments by looking at what gateways this policy targets.
+		// WAF policies can target Gateways directly, or HTTPRoutes/GRPCRoutes which are attached to Gateways.
+		targetDeployments := collectPolicyTargetDeployments(gr, policy.TargetRefs, policy.InvalidForGateways)
+
+		if len(targetDeployments) == 0 {
+			// No valid target gateways - stop any existing poller.
+			h.cfg.wafPollerManager.StopPoller(key.NsName)
+			continue
+		}
+
+		// Collect initial checksums from the just-fetched bundles.
+		var wafBundles map[graph.WAFBundleKey]*graph.WAFBundleData
+		if policy.WAFState != nil {
+			wafBundles = policy.WAFState.Bundles
+		}
+
+		initialChecksums := make(map[graph.WAFBundleKey]string, len(wafBundles))
+		for bundleKey, bundleData := range wafBundles {
+			if bundleData != nil {
+				initialChecksums[bundleKey] = bundleData.Checksum
+			}
+		}
+
+		activePolicies[key.NsName] = struct{}{}
+
+		// Reconcile the poller: starts a new one if needed, updates targets if sources
+		// haven't changed, or restarts if sources changed. This avoids unnecessary churn
+		// when only unrelated resources in the graph changed.
+		h.cfg.wafPollerManager.ReconcilePoller(ctx, wafPoller.Config{
+			PolicyNsName:      key.NsName,
+			Sources:           sources,
+			TargetDeployments: targetDeployments,
+			InitialChecksums:  initialChecksums,
+		})
+	}
+
+	// Stop pollers for policies that are no longer in the graph.
+	h.cfg.wafPollerManager.StopPollersNotIn(activePolicies)
+}
+
+// gatewayHasPendingWAFBundle returns true if any WAFPolicy that targets this Gateway
+// (directly or via an attached route) has BundlePending=true.
+// When true, the Gateway config push must be withheld to maintain fail-closed posture.
+func gatewayHasPendingWAFBundle(gr *graph.Graph, gw *graph.Gateway) bool {
+	gwNsName := types.NamespacedName{
+		Namespace: gw.Source.GetNamespace(),
+		Name:      gw.Source.GetName(),
+	}
+
+	for key, policy := range gr.NGFPolicies {
+		if key.GVK.Kind != kinds.WAFPolicy {
+			continue
+		}
+		if policy.WAFState == nil || !policy.WAFState.BundlePending {
+			continue
+		}
+		if _, invalid := policy.InvalidForGateways[gwNsName]; invalid {
+			continue
+		}
+		for _, ref := range policy.TargetRefs {
+			switch ref.Kind {
+			case kinds.Gateway:
+				if ref.Nsname == gwNsName {
+					return true
+				}
+			case kinds.HTTPRoute, kinds.GRPCRoute:
+				routeKey := graph.RouteKey{
+					NamespacedName: ref.Nsname,
+					RouteType:      routeTypeForKind(ref.Kind),
+				}
+				route, exists := gr.Routes[routeKey]
+				if !exists || !route.Valid {
+					continue
+				}
+				for _, parentRef := range route.ParentRefs {
+					if parentRef.GatewayNsName == gwNsName {
+						return true
+					}
+				}
+			}
+		}
+	}
+	return false
+}
+
+// collectPolicyTargetDeployments returns the unique set of deployment names that a policy targets.
+// It handles policies targeting Gateways directly, as well as policies targeting HTTPRoutes/GRPCRoutes
+// (which are attached to Gateways via ParentRefs).
+// Gateways present in invalidForGateways are excluded, since the policy will never be applied there.
+func collectPolicyTargetDeployments(
+	gr *graph.Graph,
+	targetRefs []graph.PolicyTargetRef,
+	invalidForGateways map[types.NamespacedName]struct{},
+) []types.NamespacedName {
+	seen := make(map[types.NamespacedName]struct{})
+	var deployments []types.NamespacedName
+
+	addGateway := func(gwNsName types.NamespacedName) {
+		if _, invalid := invalidForGateways[gwNsName]; invalid {
+			return
+		}
+		gw, exists := gr.Gateways[gwNsName]
+		if !exists || !gw.Valid {
+			return
+		}
+		if _, ok := seen[gw.DeploymentName]; ok {
+			return
+		}
+		seen[gw.DeploymentName] = struct{}{}
+		deployments = append(deployments, gw.DeploymentName)
+	}
+
+	for _, targetRef := range targetRefs {
+		switch targetRef.Kind {
+		case kinds.Gateway:
+			addGateway(targetRef.Nsname)
+		case kinds.HTTPRoute, kinds.GRPCRoute:
+			routeKey := graph.RouteKey{
+				NamespacedName: targetRef.Nsname,
+				RouteType:      routeTypeForKind(targetRef.Kind),
+			}
+			route, exists := gr.Routes[routeKey]
+			if !exists || !route.Valid {
+				continue
+			}
+			for _, parentRef := range route.ParentRefs {
+				addGateway(parentRef.GatewayNsName)
+			}
+		}
+	}
+
+	return deployments
+}
+
+// routeTypeForKind returns the RouteType for a given kind string.
+func routeTypeForKind(kind gatewayv1.Kind) graph.RouteType {
+	switch kind {
+	case kinds.HTTPRoute:
+		return graph.RouteTypeHTTP
+	case kinds.GRPCRoute:
+		return graph.RouteTypeGRPC
+	default:
+		return ""
 	}
 }
 
@@ -300,10 +555,14 @@ func (h *eventHandlerImpl) waitForStatusUpdates(ctx context.Context) {
 		case item.Error != nil:
 			h.cfg.logger.Error(item.Error, "Failed to update NGINX configuration")
 			nginxReloadRes.Error = item.Error
-		case gw != nil:
+		case gw != nil && item.NginxConfigPushed:
 			h.cfg.logger.Info("NGINX configuration was successfully updated")
 		}
-		if gw != nil {
+		// Only update LatestReloadResult when a config push was actually attempted.
+		// Status-only queue items (e.g., WAF poll callbacks) have NginxConfigPushed=false
+		// and no error; updating LatestReloadResult for those would incorrectly clear a
+		// prior NGINX reload error without any config change having occurred.
+		if gw != nil && (item.NginxConfigPushed || item.Error != nil) {
 			gw.LatestReloadResult = nginxReloadRes
 		}
 
@@ -383,6 +642,13 @@ func (h *eventHandlerImpl) updateStatuses(ctx context.Context, gr *graph.Graph, 
 	)
 
 	polReqs := status.PrepareBackendTLSPolicyRequests(gr.BackendTLSPolicies, transitionTime, h.cfg.gatewayCtlrName)
+
+	// Merge WAF poll results into policy conditions before preparing status requests.
+	// Bundle updates are applied first so that active poll errors can overwrite them
+	// during deduplication (conditions are deduplicated by Type, last-write wins).
+	h.mergeWAFBundleUpdates(gr)
+	h.mergeWAFPollErrors(gr)
+
 	ngfPolReqs := status.PrepareNGFPolicyRequests(gr.NGFPolicies, transitionTime, h.cfg.gatewayCtlrName)
 	snippetsFilterReqs := status.PrepareSnippetsFilterRequests(
 		gr.SnippetsFilters,
@@ -393,6 +659,10 @@ func (h *eventHandlerImpl) updateStatuses(ctx context.Context, gr *graph.Graph, 
 		gr.AuthenticationFilters,
 		transitionTime,
 		h.cfg.gatewayCtlrName,
+	)
+	listenerSetReqs := status.PrepareListenerSetRequests(
+		gr.ListenerSets,
+		transitionTime,
 	)
 
 	// unfortunately, status is not on clusterState stored by the change processor, so we need to make a k8sAPI call here
@@ -424,7 +694,14 @@ func (h *eventHandlerImpl) updateStatuses(ctx context.Context, gr *graph.Graph, 
 	reqs := make(
 		[]status.UpdateRequest,
 		0,
-		len(gcReqs)+len(routeReqs)+len(polReqs)+len(ngfPolReqs)+len(snippetsFilterReqs)+len(inferencePoolReqs),
+		len(gcReqs)+
+			len(routeReqs)+
+			len(polReqs)+
+			len(ngfPolReqs)+
+			len(snippetsFilterReqs)+
+			len(authenticationFilterReqs)+
+			len(listenerSetReqs)+
+			len(inferencePoolReqs),
 	)
 	reqs = append(reqs, gcReqs...)
 	reqs = append(reqs, routeReqs...)
@@ -432,6 +709,7 @@ func (h *eventHandlerImpl) updateStatuses(ctx context.Context, gr *graph.Graph, 
 	reqs = append(reqs, ngfPolReqs...)
 	reqs = append(reqs, snippetsFilterReqs...)
 	reqs = append(reqs, authenticationFilterReqs...)
+	reqs = append(reqs, listenerSetReqs...)
 	reqs = append(reqs, inferencePoolReqs...)
 
 	h.cfg.statusUpdater.UpdateGroup(ctx, groupAllExceptGateways, reqs...)
@@ -445,6 +723,108 @@ func (h *eventHandlerImpl) updateStatuses(ctx context.Context, gr *graph.Graph, 
 		gw.LatestReloadResult,
 	)
 	h.cfg.statusUpdater.UpdateGroup(ctx, groupGateways, gwReqs...)
+}
+
+// mergeWAFPollErrors adds StaleBundleWarning conditions to policies that have active poll errors.
+// This is called before preparing status requests so that poll failures are reflected in status.
+func (h *eventHandlerImpl) mergeWAFPollErrors(gr *graph.Graph) {
+	if h.cfg.wafPollerManager == nil {
+		return
+	}
+
+	pollErrors := h.cfg.wafPollerManager.GetAllPollErrors()
+	for policyNsName, pollError := range pollErrors {
+		policyKey := findWAFPolicyKey(gr, policyNsName)
+		if policyKey == nil {
+			continue
+		}
+
+		policy := gr.NGFPolicies[*policyKey]
+		if policy == nil || !policy.Valid {
+			continue
+		}
+
+		// Only add a stale-bundle warning if the bundle was previously fetched successfully.
+		// If no bundle exists for this key, the initial fetch failed and there's already a
+		// Programmed=False condition that we shouldn't mask.
+		if policy.WAFState == nil || policy.WAFState.Bundles[pollError.BundleKey] == nil {
+			continue
+		}
+
+		// Upsert a stale-bundle warning condition for the poll error.
+		// Replace any existing condition with the same Type so that repeated calls (e.g.,
+		// multiple status updates reusing the same graph) don't accumulate same-Type conditions.
+		// Status preparation deduplicates by Type only, so matching on Type is sufficient.
+		cond := conditions.NewPolicyProgrammedStaleBundleWarning(pollError.BundleDescription, pollError.Err.Error())
+
+		replaced := false
+		for i, existing := range policy.Conditions {
+			if existing.Type == cond.Type {
+				policy.Conditions[i] = cond
+				replaced = true
+				break
+			}
+		}
+		if !replaced {
+			policy.Conditions = append(policy.Conditions, cond)
+		}
+	}
+}
+
+// mergeWAFBundleUpdates adds a BundleUpdated condition to policies where the poller detected a
+// changed bundle and dispatched it to target deployments. The condition reflects the most recent
+// detected bundle change and is not cleared after a status update.
+func (h *eventHandlerImpl) mergeWAFBundleUpdates(gr *graph.Graph) {
+	if h.cfg.wafPollerManager == nil {
+		return
+	}
+
+	for policyNsName, update := range h.cfg.wafPollerManager.GetAllBundleUpdates() {
+		policyKey := findWAFPolicyKey(gr, policyNsName)
+		if policyKey == nil {
+			continue
+		}
+
+		policy := gr.NGFPolicies[*policyKey]
+		if policy == nil || !policy.Valid {
+			continue
+		}
+
+		cond := conditions.NewPolicyProgrammedBundleUpdated(update.BundleDescription, update.Checksum, update.UpdatedAt)
+
+		found := false
+		for i, existing := range policy.Conditions {
+			if existing.Type != cond.Type {
+				continue
+			}
+			found = true
+			// Only overwrite "healthy" Programmed=True conditions (Programmed or BundleUpdated).
+			// Do not overwrite Programmed=False states (e.g. BundlePending, FetchError) or
+			// Programmed=True warning states (e.g. StaleBundleWarning) — those reflect active
+			// error/warning signals that must not be silenced by a historical bundle update.
+			healthy := existing.Status == metav1.ConditionTrue &&
+				(existing.Reason == string(conditions.PolicyReasonProgrammed) ||
+					existing.Reason == string(conditions.PolicyReasonBundleUpdated))
+			if healthy {
+				policy.Conditions[i] = cond
+			}
+			break
+		}
+		if !found {
+			policy.Conditions = append(policy.Conditions, cond)
+		}
+	}
+}
+
+// findWAFPolicyKey finds the PolicyKey in the graph for a given WAFPolicy namespace/name.
+func findWAFPolicyKey(gr *graph.Graph, nsName types.NamespacedName) *graph.PolicyKey {
+	for key := range gr.NGFPolicies {
+		if key.GVK.Kind == kinds.WAFPolicy && key.NsName == nsName {
+			k := key
+			return &k
+		}
+	}
+	return nil
 }
 
 func (h *eventHandlerImpl) parseAndCaptureEvent(ctx context.Context, logger logr.Logger, event any) {
@@ -471,6 +851,25 @@ func (h *eventHandlerImpl) parseAndCaptureEvent(ctx context.Context, logger logr
 		}
 
 		h.cfg.processor.CaptureDeleteChange(e.Type, e.NamespacedName)
+	case events.WAFBundleReconcileEvent:
+		// Guard against stale events: the poller may have been stopped (policy deleted) between
+		// when the event was queued and when it is processed here. Skip the rebuild if the poller
+		// is no longer registered — its bundle cache has already been cleared and a subsequent
+		// delete event will drive the correct config update.
+		if h.cfg.wafPollerManager != nil && !h.cfg.wafPollerManager.HasPoller(e.PolicyNsName) {
+			logger.V(1).Info(
+				"WAF bundle reconcile event for policy with no active poller, skipping rebuild",
+				"policy", e.PolicyNsName,
+			)
+			return
+		}
+		logger.V(1).Info("WAF bundle now available, triggering re-reconcile", "policy", e.PolicyNsName)
+		// Mark the processor dirty so Process() performs a graph rebuild even if this is the
+		// only event in the batch. Without this, clusterStateChanged=false causes Process() to
+		// return nil and the pending Gateway is never unblocked.
+		// We do not call CaptureUpsertChange here because that would overwrite the real policy
+		// object in cluster state with a metadata-only stub, corrupting the next graph build.
+		h.cfg.processor.ForceRebuild()
 	default:
 		panic(fmt.Errorf("unknown event type %T", e))
 	}
@@ -571,32 +970,37 @@ func getGatewayAddresses(
 		gwSvc = *svc
 	}
 
-	return getGatewayAddressesForStatus(&gwSvc, gateway), nil
+	return getGatewayAddressesForStatus(&gwSvc), nil
 }
 
-func getGatewayAddressesForStatus(
-	svc *v1.Service,
-	gateway *graph.Gateway,
-) (gwAddresses []gatewayv1.GatewayStatusAddress) {
+func getGatewayAddressesForStatus(svc *v1.Service) (gwAddresses []gatewayv1.GatewayStatusAddress) {
+	// Preserve order but deduplicate addresses and hostnames so the Gateway status
+	// does not contain duplicates coming from Service status and Gateway spec.addresses.
+	addrSeen := make(map[string]struct{})
+	hostSeen := make(map[string]struct{})
+
 	var addresses, hostnames []string
+
 	switch svc.Spec.Type {
 	case v1.ServiceTypeLoadBalancer:
 		for _, ingress := range svc.Status.LoadBalancer.Ingress {
 			if ingress.IP != "" {
-				addresses = append(addresses, ingress.IP)
+				if _, ok := addrSeen[ingress.IP]; !ok {
+					addrSeen[ingress.IP] = struct{}{}
+					addresses = append(addresses, ingress.IP)
+				}
 			} else if ingress.Hostname != "" {
-				hostnames = append(hostnames, ingress.Hostname)
+				if _, ok := hostSeen[ingress.Hostname]; !ok {
+					hostSeen[ingress.Hostname] = struct{}{}
+					hostnames = append(hostnames, ingress.Hostname)
+				}
 			}
 		}
 	default:
-		addresses = append(addresses, svc.Spec.ClusterIP)
-	}
-
-	for _, address := range gateway.Source.Spec.Addresses {
-		if address.Type != nil &&
-			*address.Type == gatewayv1.IPAddressType &&
-			net.ParseIP(address.Value) != nil {
-			addresses = append(addresses, address.Value)
+		if svc.Spec.ClusterIP != "" {
+			addr := svc.Spec.ClusterIP
+			addrSeen[addr] = struct{}{}
+			addresses = append(addresses, addr)
 		}
 	}
 
@@ -616,6 +1020,7 @@ func getGatewayAddressesForStatus(
 		}
 		gwAddresses = append(gwAddresses, statusAddr)
 	}
+
 	return gwAddresses
 }
 
@@ -655,6 +1060,162 @@ func (h *eventHandlerImpl) setLatestConfiguration(gateway *graph.Gateway, cfg *d
 
 func objectFilterKey(obj client.Object, nsName types.NamespacedName) filterKey {
 	return filterKey(fmt.Sprintf("%T_%s_%s", obj, nsName.Namespace, nsName.Name))
+}
+
+func (h *eventHandlerImpl) reconcileAPResourceFinalizers(
+	ctx context.Context,
+	logger logr.Logger,
+	gr *graph.Graph,
+) {
+	if !h.isLeader() {
+		return
+	}
+
+	// When PLM is not configured, the controller does not watch AP resources and has no RBAC
+	// permissions to list or patch them, so there is nothing to reconcile.
+	if !h.cfg.plmEnabled {
+		return
+	}
+
+	h.finalizerLock.Lock()
+	defer h.finalizerLock.Unlock()
+
+	if err := h.initializeAPResourceFinalizers(ctx); err != nil {
+		logger.Error(err, "Failed to initialize AP resource finalizer state")
+		return
+	}
+
+	desired := make(map[apResourceKey]struct{})
+	for nsName := range gr.ReferencedAPPolicies {
+		desired[apResourceKey{nsName: nsName, resourceType: apResourceTypePolicy}] = struct{}{}
+	}
+	for nsName := range gr.ReferencedAPLogConfs {
+		desired[apResourceKey{nsName: nsName, resourceType: apResourceTypeLogConf}] = struct{}{}
+	}
+
+	for key := range desired {
+		if _, exists := h.finalizedAPResources[key]; exists {
+			continue
+		}
+
+		reconciled, err := h.updateAPResourceFinalizer(ctx, key, controllerutil.AddFinalizer)
+		if err != nil {
+			logger.Error(err, "Failed to add finalizer to AP resource", "resource", key.nsName)
+			continue
+		}
+		if !reconciled {
+			continue
+		}
+
+		h.finalizedAPResources[key] = struct{}{}
+	}
+
+	for key := range h.finalizedAPResources {
+		if _, exists := desired[key]; exists {
+			continue
+		}
+
+		reconciled, err := h.updateAPResourceFinalizer(ctx, key, controllerutil.RemoveFinalizer)
+		if err != nil {
+			logger.Error(err, "Failed to remove finalizer from AP resource", "resource", key.nsName)
+			continue
+		}
+		if !reconciled {
+			delete(h.finalizedAPResources, key)
+			continue
+		}
+
+		delete(h.finalizedAPResources, key)
+	}
+}
+
+func (h *eventHandlerImpl) initializeAPResourceFinalizers(ctx context.Context) error {
+	if h.finalizersInitialized {
+		return nil
+	}
+
+	resources, err := h.listFinalizedAPResources(ctx)
+	if err != nil {
+		return err
+	}
+
+	h.finalizedAPResources = resources
+	h.finalizersInitialized = true
+
+	return nil
+}
+
+func (h *eventHandlerImpl) listFinalizedAPResources(ctx context.Context) (map[apResourceKey]struct{}, error) {
+	resources := make(map[apResourceKey]struct{})
+
+	if err := h.collectFinalizedAPResources(ctx, kinds.NewAPPolicyList(), apResourceTypePolicy, resources); err != nil {
+		return nil, err
+	}
+
+	if err := h.collectFinalizedAPResources(ctx, kinds.NewAPLogConfList(), apResourceTypeLogConf, resources); err != nil {
+		return nil, err
+	}
+
+	return resources, nil
+}
+
+func (h *eventHandlerImpl) collectFinalizedAPResources(
+	ctx context.Context,
+	list *unstructured.UnstructuredList,
+	resourceType apResourceType,
+	resources map[apResourceKey]struct{},
+) error {
+	if err := h.cfg.k8sClient.List(ctx, list); err != nil {
+		if apierrors.IsNotFound(err) || apimeta.IsNoMatchError(err) {
+			return nil
+		}
+
+		return fmt.Errorf("listing %s resources: %w", resourceType, err)
+	}
+
+	for i := range list.Items {
+		if !controllerutil.ContainsFinalizer(&list.Items[i], apResourceFinalizer) {
+			continue
+		}
+
+		resources[apResourceKey{
+			nsName:       client.ObjectKeyFromObject(&list.Items[i]),
+			resourceType: resourceType,
+		}] = struct{}{}
+	}
+
+	return nil
+}
+
+func (h *eventHandlerImpl) updateAPResourceFinalizer(
+	ctx context.Context,
+	key apResourceKey,
+	mutateFinalizer func(client.Object, string) bool,
+) (bool, error) {
+	obj := kinds.NewAPPolicyObject()
+	if key.resourceType == apResourceTypeLogConf {
+		obj = kinds.NewAPLogConfObject()
+	}
+
+	if err := h.cfg.k8sClient.Get(ctx, key.nsName, obj); err != nil {
+		if apierrors.IsNotFound(err) {
+			return false, nil
+		}
+
+		return false, fmt.Errorf("getting AP resource: %w", err)
+	}
+
+	patch := client.MergeFrom(obj.DeepCopy())
+
+	if changed := mutateFinalizer(obj, apResourceFinalizer); !changed {
+		return true, nil
+	}
+
+	if err := h.cfg.k8sClient.Patch(ctx, obj, patch); err != nil {
+		return false, fmt.Errorf("patching AP resource finalizer: %w", err)
+	}
+
+	return true, nil
 }
 
 // ensureInferencePoolServices ensures a headless Service exists and is up to date for each InferencePool.

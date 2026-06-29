@@ -110,6 +110,12 @@ rules:
 - apiGroups:
   - ""
   resources:
+  - services/status
+  verbs:
+  - patch
+- apiGroups:
+  - ""
+  resources:
   - pods
   verbs:
   - get
@@ -154,6 +160,17 @@ rules:
   - get
   - watch
 - apiGroups:
+  - policy
+  resources:
+  - poddisruptionbudgets
+  verbs:
+  - create
+  - update
+  - delete
+  - list
+  - get
+  - watch
+- apiGroups:
   - discovery.k8s.io
   resources:
   - endpointslices
@@ -169,6 +186,7 @@ rules:
   - grpcroutes
   - backendtlspolicies
   - tlsroutes
+  - listenersets
   verbs:
   - list
   - watch
@@ -182,6 +200,7 @@ rules:
   - grpcroutes/status
   - backendtlspolicies/status
   - tlsroutes/status
+  - listenersets/status
   verbs:
   - update
 - apiGroups:
@@ -202,6 +221,7 @@ rules:
   - authenticationfilters
   - proxysettingspolicies
   - ratelimitpolicies
+  - wafpolicies
   verbs:
   - list
   - watch
@@ -215,6 +235,7 @@ rules:
   - authenticationfilters/status
   - proxysettingspolicies/status
   - ratelimitpolicies/status
+  - wafpolicies/status
   verbs:
   - update
 - apiGroups:
@@ -291,6 +312,10 @@ spec:
     port: 443
     protocol: TCP
     targetPort: 8443
+  - name: metrics
+    port: 9113
+    protocol: TCP
+    targetPort: 9113
   selector:
     app.kubernetes.io/instance: nginx-gateway
     app.kubernetes.io/name: nginx-gateway
@@ -329,6 +354,7 @@ spec:
         - --config=nginx-gateway-config
         - --service=nginx-gateway
         - --agent-tls-secret=agent-tls
+        - --server-tls-domain=svc
         - --nginx-docker-secret=nginx-plus-registry-secret
         - --nginx-plus
         - --usage-report-secret=nplus-license
@@ -368,11 +394,14 @@ spec:
         - containerPort: 8081
           name: health
         readinessProbe:
+          failureThreshold: 3
           httpGet:
             path: /readyz
             port: health
           initialDelaySeconds: 3
-          periodSeconds: 1
+          periodSeconds: 10
+          successThreshold: 1
+          timeoutSeconds: 1
         securityContext:
           allowPrivilegeEscalation: false
           capabilities:
@@ -416,6 +445,7 @@ spec:
         - generate-certs
         - --service=nginx-gateway
         - --cluster-domain=cluster.local
+        - --server-tls-domain=svc
         - --server-tls-secret=server-tls
         - --agent-tls-secret=agent-tls
         env:

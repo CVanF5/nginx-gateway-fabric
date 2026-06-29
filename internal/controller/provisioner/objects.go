@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"maps"
+	"net"
 	"sort"
 	"strconv"
 	"strings"
@@ -15,6 +16,7 @@ import (
 	appsv1 "k8s.io/api/apps/v1"
 	autoscalingv2 "k8s.io/api/autoscaling/v2"
 	corev1 "k8s.io/api/core/v1"
+	policyv1 "k8s.io/api/policy/v1"
 	rbacv1 "k8s.io/api/rbac/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/types"
@@ -33,6 +35,7 @@ import (
 	"github.com/nginx/nginx-gateway-fabric/v2/internal/controller/state/graph/shared/secrets"
 	"github.com/nginx/nginx-gateway-fabric/v2/internal/framework/controller"
 	"github.com/nginx/nginx-gateway-fabric/v2/internal/framework/helpers"
+	"github.com/nginx/nginx-gateway-fabric/v2/internal/framework/waf"
 )
 
 const (
@@ -43,10 +46,21 @@ const (
 	defaultServiceType   = corev1.ServiceTypeLoadBalancer
 	defaultServicePolicy = corev1.ServiceExternalTrafficPolicyLocal
 
-	defaultNginxImagePath      = "ghcr.io/nginx/nginx-gateway-fabric/nginx"
-	defaultNginxPlusImagePath  = "private-registry.nginx.com/nginx-gateway-fabric/nginx-plus"
-	defaultImagePullPolicy     = corev1.PullIfNotPresent
-	defaultInitialDelaySeconds = int32(3)
+	defaultNginxImagePath        = "ghcr.io/nginx/nginx-gateway-fabric/nginx"
+	defaultNginxPlusImagePath    = "private-registry.nginx.com/nginx-gateway-fabric/nginx-plus"
+	defaultNginxPlusWAFImagePath = "private-registry.nginx.com/nginx-gateway-fabric/nginx-plus-f5waf"
+	defaultImagePullPolicy       = corev1.PullIfNotPresent
+	defaultInitialDelaySeconds   = int32(3)
+
+	// WAF container defaults.
+	defaultWAFEnforcerImagePath  = "private-registry.nginx.com/nap/waf-enforcer"
+	defaultWAFConfigMgrImagePath = "private-registry.nginx.com/nap/waf-config-mgr"
+
+	// WAF shared volume names.
+	appProtectBundlesVolumeName  = "app-protect-bundles"
+	appProtectConfigVolumeName   = "app-protect-config"
+	appProtectBdConfigVolumeName = "app-protect-bd-config"
+	appProtectLockVolumeName     = "app-protect-lock"
 )
 
 // portProtoEntry represents a unique port and protocol combination.
@@ -76,10 +90,13 @@ type resourceNames struct {
 }
 
 // buildNginxResourceObjects builds all the NGINX resource objects for a given Gateway and EffectiveNginxProxy.
+// The allListeners parameter must include all listeners from both the Gateway and any attached ListenerSets;
+// these are used to determine which ports the Service and container should expose.
 func (p *NginxProvisioner) buildNginxResourceObjects(
 	resourceName string,
 	gateway *gatewayv1.Gateway,
 	nProxyCfg *graph.EffectiveNginxProxy,
+	allListeners []*graph.Listener,
 ) ([]client.Object, error) {
 	// NOTE: When adding new fields to the generated objects, please ensure to update the corresponding spec
 	// setter function in setter.go to set the new fields when updating the object.
@@ -137,8 +154,8 @@ func (p *NginxProvisioner) buildNginxResourceObjects(
 		}
 	}
 
-	// build ports from gateway listeners
-	ports := p.buildPortsFromListeners(gateway.Spec.Listeners)
+	// build ports from all listeners (Gateway + ListenerSets)
+	ports := p.buildPortsFromListeners(allListeners)
 
 	// Add healthcheck port to service if expose is enabled
 	var healthcheckPort int32
@@ -147,7 +164,7 @@ func (p *NginxProvisioner) buildNginxResourceObjects(
 		ports = appendUniquePortProtoEntry(ports, portProtoEntry{Port: healthcheckPort, Protocol: corev1.ProtocolTCP})
 	}
 
-	service, err := buildNginxService(
+	service, err := p.buildNginxService(
 		cloneObjectMeta(objectMeta),
 		nProxyCfg,
 		ports,
@@ -190,6 +207,7 @@ func (p *NginxProvisioner) buildNginxResourceObjects(
 	// service
 	// deployment/daemonset
 	// hpa
+	// pdb
 
 	objects := make([]client.Object, 0, len(configmapsList)+len(secretsList)+len(openshiftObjs)+3)
 	objects = append(objects, secretsList...)
@@ -201,6 +219,21 @@ func (p *NginxProvisioner) buildNginxResourceObjects(
 
 	objects = append(objects, service, deployment)
 
+	objects, errs = p.buildHPAAndPDB(objectMeta, nProxyCfg, selectorLabels, gateway, objects, errs)
+
+	return objects, errors.Join(errs...)
+}
+
+// buildHPAAndPDB builds the HPA and PDB for the NGINX deployment
+// if they are enabled in the EffectiveNginxProxy configuration.
+func (p *NginxProvisioner) buildHPAAndPDB(
+	objectMeta metav1.ObjectMeta,
+	nProxyCfg *graph.EffectiveNginxProxy,
+	selectorLabels map[string]string,
+	gateway *gatewayv1.Gateway,
+	objects []client.Object,
+	errs []error,
+) ([]client.Object, []error) {
 	if hpa := p.buildHPA(objectMeta, nProxyCfg); hpa != nil {
 		if err := p.setOwnerReference(hpa, gateway); err != nil {
 			errs = append(errs, fmt.Errorf("failed to set owner reference on HPA %s: %w", hpa.GetName(), err))
@@ -208,7 +241,14 @@ func (p *NginxProvisioner) buildNginxResourceObjects(
 		objects = append(objects, hpa)
 	}
 
-	return objects, errors.Join(errs...)
+	if pdb := p.buildPDB(objectMeta, nProxyCfg, selectorLabels); pdb != nil {
+		if err := p.setOwnerReference(pdb, gateway); err != nil {
+			errs = append(errs, fmt.Errorf("failed to set owner reference on pod disruption budget %s: %w", pdb.GetName(), err))
+		}
+		objects = append(objects, pdb)
+	}
+
+	return objects, errs
 }
 
 // buildResourceNames builds all the resource names for a given gateway resource name.
@@ -294,20 +334,21 @@ func (p *NginxProvisioner) buildServiceAccount(
 	return serviceAccount, nil
 }
 
-// buildPortsFromListeners builds a list of port/protocol entries from the Gateway listeners.
+// buildPortsFromListeners builds a list of port/protocol entries from the graph listeners.
+// This includes listeners from both the Gateway and any attached ListenerSets.
 // A port number can appear multiple times if it has different protocols (e.g., TCP and UDP on port 53).
-func (p *NginxProvisioner) buildPortsFromListeners(listeners []gatewayv1.Listener) []portProtoEntry {
+func (p *NginxProvisioner) buildPortsFromListeners(listeners []*graph.Listener) []portProtoEntry {
 	seen := make(map[portProtoEntry]struct{}, len(listeners))
 	ports := make([]portProtoEntry, 0, len(listeners))
 	for _, listener := range listeners {
 		var protocol corev1.Protocol
-		switch listener.Protocol {
+		switch listener.Source.Protocol {
 		case gatewayv1.UDPProtocolType:
 			protocol = corev1.ProtocolUDP
 		default:
 			protocol = corev1.ProtocolTCP
 		}
-		entry := portProtoEntry{Port: listener.Port, Protocol: protocol}
+		entry := portProtoEntry{Port: listener.Source.Port, Protocol: protocol}
 		if _, exists := seen[entry]; !exists {
 			seen[entry] = struct{}{}
 			ports = append(ports, entry)
@@ -349,6 +390,30 @@ func (p *NginxProvisioner) buildHPA(
 	}
 
 	return buildNginxDeploymentHPA(objectMeta, nProxyCfg.Kubernetes.Deployment.Autoscaling)
+}
+
+func (p *NginxProvisioner) buildPDB(
+	objectMeta metav1.ObjectMeta,
+	nProxyCfg *graph.EffectiveNginxProxy,
+	selectorLabels map[string]string,
+) client.Object {
+	if nProxyCfg == nil || nProxyCfg.Kubernetes == nil || nProxyCfg.Kubernetes.Deployment == nil ||
+		nProxyCfg.Kubernetes.Deployment.PodDisruptionBudget == nil {
+		return nil
+	}
+
+	pdbSpec := nProxyCfg.Kubernetes.Deployment.PodDisruptionBudget
+	return &policyv1.PodDisruptionBudget{
+		ObjectMeta: objectMeta,
+		Spec: policyv1.PodDisruptionBudgetSpec{
+			Selector: &metav1.LabelSelector{
+				MatchLabels: selectorLabels,
+			},
+			MinAvailable:               pdbSpec.MinAvailable,
+			MaxUnavailable:             pdbSpec.MaxUnavailable,
+			UnhealthyPodEvictionPolicy: pdbSpec.UnhealthyPodEvictionPolicy,
+		},
+	}
 }
 
 func (p *NginxProvisioner) buildNginxSecrets(
@@ -556,20 +621,30 @@ func (p *NginxProvisioner) buildAgentConfigMap(
 	}
 
 	agentLabels := maps.Clone(p.cfg.AgentLabels)
+	if agentLabels == nil {
+		agentLabels = make(map[string]string)
+	}
 	agentLabels[nginxTypes.AgentOwnerNameLabel] = fmt.Sprintf("%s_%s", objectMeta.Namespace, objectMeta.Name)
 	agentLabels[nginxTypes.AgentOwnerTypeLabel] = depType
 
 	agentFields := map[string]any{
-		"Plus":          p.cfg.Plus,
-		"ServiceName":   p.cfg.GatewayPodConfig.ServiceName,
-		"Namespace":     p.cfg.GatewayPodConfig.Namespace,
-		"EnableMetrics": enableMetrics,
-		"MetricsPort":   metricsPort,
-		"AgentLabels":   agentLabels,
+		"Plus":            p.cfg.Plus,
+		"ServiceName":     p.cfg.GatewayPodConfig.ServiceName,
+		"Namespace":       p.cfg.GatewayPodConfig.Namespace,
+		"ServerTLSDomain": p.cfg.ServerTLSDomain,
+		"EnableMetrics":   enableMetrics,
+		"MetricsPort":     metricsPort,
+		"AgentLabels":     agentLabels,
 	}
 
-	if nProxyCfg != nil && nProxyCfg.Logging != nil && nProxyCfg.Logging.AgentLevel != nil {
-		agentFields["LogLevel"] = *nProxyCfg.Logging.AgentLevel
+	if nProxyCfg != nil {
+		if graph.WAFEnabledForNginxProxy(nProxyCfg) {
+			agentFields["WafEnabled"] = true
+		}
+
+		if nProxyCfg.Logging != nil && nProxyCfg.Logging.AgentLevel != nil {
+			agentFields["LogLevel"] = *nProxyCfg.Logging.AgentLevel
+		}
 	}
 
 	if p.cfg.NginxOneConsoleTelemetryConfig.DataplaneKeySecretName != "" {
@@ -636,7 +711,7 @@ func (p *NginxProvisioner) buildOpenshiftObjects(
 	return []client.Object{role, roleBinding}, errs
 }
 
-func buildNginxService(
+func (p *NginxProvisioner) buildNginxService(
 	objectMeta metav1.ObjectMeta,
 	nProxyCfg *graph.EffectiveNginxProxy,
 	ports []portProtoEntry,
@@ -656,13 +731,13 @@ func buildNginxService(
 
 	var externalIPs []string
 	for _, addr := range addresses {
-		if addr.Type != nil && *addr.Type == gatewayv1.IPAddressType {
+		if addr.Type != nil && *addr.Type == gatewayv1.IPAddressType && net.ParseIP(addr.Value) != nil {
 			externalIPs = append(externalIPs, addr.Value)
 		}
 	}
 
 	var servicePolicy corev1.ServiceExternalTrafficPolicy
-	if serviceType != corev1.ServiceTypeClusterIP || len(externalIPs) > 0 {
+	if serviceType != corev1.ServiceTypeClusterIP {
 		servicePolicy = defaultServicePolicy
 		if serviceCfg.ExternalTrafficPolicy != nil {
 			servicePolicy = corev1.ServiceExternalTrafficPolicy(*serviceCfg.ExternalTrafficPolicy)
@@ -677,7 +752,6 @@ func buildNginxService(
 			Type:                  serviceType,
 			Ports:                 servicePorts,
 			ExternalTrafficPolicy: servicePolicy,
-			ExternalIPs:           externalIPs,
 			Selector:              selectorLabels,
 			IPFamilyPolicy:        helpers.GetPointer(corev1.IPFamilyPolicyPreferDualStack),
 		},
@@ -687,14 +761,29 @@ func buildNginxService(
 
 	setSvcLoadBalancerSettings(serviceCfg, &svc.Spec)
 
-	// Apply service patches
+	// Apply service patches before the LoadBalancerClass check so that a patch-provided
+	// class is visible when we decide whether to set our own.
 	if nProxyCfg != nil && nProxyCfg.Kubernetes != nil && nProxyCfg.Kubernetes.Service != nil {
 		if err := applyPatches(svc, nProxyCfg.Kubernetes.Service.Patches); err != nil {
 			return svc, fmt.Errorf("failed to apply service patches: %w", err)
 		}
 	}
 
+	p.updateLoadBalancerClass(svc, externalIPs)
+
 	return svc, nil
+}
+
+// updateLoadBalancerClass sets the Service's LoadBalancerClass to this controller
+// if the Gateway has IP addresses and the Service is a LoadBalancer.
+func (p *NginxProvisioner) updateLoadBalancerClass(
+	svc *corev1.Service,
+	gwExternalIPs []string,
+) {
+	if svc.Spec.Type == corev1.ServiceTypeLoadBalancer && len(gwExternalIPs) > 0 {
+		ctlr := p.cfg.GatewayCtlrName
+		svc.Spec.LoadBalancerClass = &ctlr
+	}
 }
 
 func buildServicePorts(
@@ -946,19 +1035,83 @@ func applyPatches(obj client.Object, patches []ngfAPIv1alpha2.Patch) error {
 	return nil
 }
 
-//nolint:gocyclo // will refactor at some point
+// buildNginxPodTemplateSpec builds the complete pod template spec.
 func (p *NginxProvisioner) buildNginxPodTemplateSpec(
 	objectMeta metav1.ObjectMeta,
 	nProxyCfg *graph.EffectiveNginxProxy,
 	ports []portProtoEntry,
 	names resourceNames,
 ) corev1.PodTemplateSpec {
+	// Build container ports and pod annotations
+	containerPorts, podAnnotations := p.buildContainerPortsAndAnnotations(ports, nProxyCfg, objectMeta.Annotations)
+
+	// Build NGINX container
+	nginxContainer := p.buildNginxContainer(containerPorts, nProxyCfg)
+
+	// Build base volumes
+	volumes := p.buildBaseVolumes(names)
+
+	// Build containers list
+	containers := []corev1.Container{nginxContainer}
+
+	// Configure WAF if enabled (requires NGINX Plus)
+	if p.cfg.Plus && graph.WAFEnabledForNginxProxy(nProxyCfg) {
+		containers, volumes = p.configureWAF(containers, volumes, nProxyCfg)
+	}
+
+	// Build init containers
+	initContainers := p.buildInitContainers(nProxyCfg)
+
+	// Create base pod template spec
+	spec := p.buildBasePodTemplateSpec(objectMeta, podAnnotations, containers, initContainers, volumes)
+
+	// Apply user configuration overrides
+	p.applyUserConfiguration(&spec, nProxyCfg)
+
+	// Configure image pull secrets
+	p.configureImagePullSecrets(&spec, names)
+
+	// Configure NGINX Plus if enabled
+	if p.cfg.Plus {
+		p.configureNginxPlus(&spec, names)
+	}
+
+	// Configure dataplane key secret for NGINX One Console telemetry
+	if p.cfg.NginxOneConsoleTelemetryConfig.DataplaneKeySecretName != "" {
+		p.configureDataplaneKeySecret(&spec, names)
+	}
+
+	// Configure inference extension if enabled
+	if p.cfg.InferenceExtension {
+		var containerResources corev1.ResourceRequirements
+		if nProxyCfg != nil && nProxyCfg.Kubernetes != nil {
+			var containerSpec *ngfAPIv1alpha2.ContainerSpec
+			if nProxyCfg.Kubernetes.Deployment != nil {
+				containerSpec = &nProxyCfg.Kubernetes.Deployment.Container
+			} else if nProxyCfg.Kubernetes.DaemonSet != nil {
+				containerSpec = &nProxyCfg.Kubernetes.DaemonSet.Container
+			}
+			if containerSpec != nil && containerSpec.Resources != nil {
+				containerResources = *containerSpec.Resources
+			}
+		}
+		p.configureInferenceExtension(&spec, containerResources)
+	}
+
+	return spec
+}
+
+// buildContainerPortsAndAnnotations builds container ports and pod annotations.
+func (p *NginxProvisioner) buildContainerPortsAndAnnotations(
+	ports []portProtoEntry,
+	nProxyCfg *graph.EffectiveNginxProxy,
+	baseAnnotations map[string]string,
+) ([]corev1.ContainerPort, map[string]string) {
 	// Determine which port numbers have multiple protocols for naming.
 	protocolsPerPort := make(map[int32]int)
 	for _, entry := range ports {
 		protocolsPerPort[entry.Port]++
 	}
-
 	containerPorts := make([]corev1.ContainerPort, 0, len(ports))
 	for _, entry := range ports {
 		name := fmt.Sprintf("port-%d", entry.Port)
@@ -974,10 +1127,11 @@ func (p *NginxProvisioner) buildNginxPodTemplateSpec(
 	}
 
 	podAnnotations := make(map[string]string)
-	maps.Copy(podAnnotations, objectMeta.Annotations)
+	maps.Copy(podAnnotations, baseAnnotations)
 
-	metricsPort := config.DefaultNginxMetricsPort
+	// Add metrics port if enabled
 	if port, enabled := graph.MetricsEnabledForNginxProxy(nProxyCfg); enabled {
+		metricsPort := config.DefaultNginxMetricsPort
 		if port != nil {
 			metricsPort = *port
 		}
@@ -1000,108 +1154,194 @@ func (p *NginxProvisioner) buildNginxPodTemplateSpec(
 		return containerPorts[i].Protocol < containerPorts[j].Protocol
 	})
 
+	return containerPorts, podAnnotations
+}
+
+// buildNginxContainer builds the base NGINX container.
+func (p *NginxProvisioner) buildNginxContainer(
+	containerPorts []corev1.ContainerPort,
+	nProxyCfg *graph.EffectiveNginxProxy,
+) corev1.Container {
 	image, pullPolicy := p.buildImage(nProxyCfg)
+
+	return corev1.Container{
+		Name:            "nginx",
+		Image:           image,
+		ImagePullPolicy: pullPolicy,
+		Ports:           containerPorts,
+		ReadinessProbe:  p.buildReadinessProbe(nProxyCfg),
+		SecurityContext: &corev1.SecurityContext{
+			Capabilities: &corev1.Capabilities{
+				Drop: []corev1.Capability{"ALL"},
+			},
+			AllowPrivilegeEscalation: helpers.GetPointer(false),
+			ReadOnlyRootFilesystem:   helpers.GetPointer(true),
+			RunAsGroup:               helpers.GetPointer[int64](1001),
+			RunAsUser:                helpers.GetPointer[int64](101),
+			SeccompProfile: &corev1.SeccompProfile{
+				Type: corev1.SeccompProfileTypeRuntimeDefault,
+			},
+		},
+		VolumeMounts: []corev1.VolumeMount{
+			{MountPath: "/etc/nginx-agent", Name: "nginx-agent"},
+			{MountPath: "/var/run/secrets/ngf", Name: "nginx-agent-tls"},
+			{MountPath: "/var/run/secrets/ngf/serviceaccount", Name: "token"},
+			{MountPath: "/var/log/nginx-agent", Name: "nginx-agent-log"},
+			{MountPath: "/var/lib/nginx-agent", Name: "nginx-agent-lib"},
+			{MountPath: "/etc/nginx/conf.d", Name: "nginx-conf"},
+			{MountPath: "/etc/nginx/stream-conf.d", Name: "nginx-stream-conf"},
+			{MountPath: "/etc/nginx/main-includes", Name: "nginx-main-includes"},
+			{MountPath: "/etc/nginx/events-includes", Name: "nginx-events-includes"},
+			{MountPath: "/etc/nginx/secrets", Name: "nginx-secrets"},
+			{MountPath: "/var/run/nginx", Name: "nginx-run"},
+			{MountPath: "/var/cache/nginx", Name: "nginx-cache"},
+			{MountPath: "/etc/nginx/includes", Name: "nginx-includes"},
+		},
+	}
+}
+
+// buildBaseVolumes builds the base volumes needed for NGINX.
+func (p *NginxProvisioner) buildBaseVolumes(names resourceNames) []corev1.Volume {
 	tokenAudience := fmt.Sprintf("%s.%s.svc", p.cfg.GatewayPodConfig.ServiceName, p.cfg.GatewayPodConfig.Namespace)
+
+	return []corev1.Volume{
+		{
+			Name: "token",
+			VolumeSource: corev1.VolumeSource{
+				Projected: &corev1.ProjectedVolumeSource{
+					Sources: []corev1.VolumeProjection{
+						{
+							ServiceAccountToken: &corev1.ServiceAccountTokenProjection{
+								Path:     "token",
+								Audience: tokenAudience,
+							},
+						},
+					},
+				},
+			},
+		},
+		{Name: "nginx-agent", VolumeSource: emptyDirVolumeSource},
+		{
+			Name: "nginx-agent-config",
+			VolumeSource: corev1.VolumeSource{
+				ConfigMap: &corev1.ConfigMapVolumeSource{
+					LocalObjectReference: corev1.LocalObjectReference{
+						Name: names.nginxAgentConfigMap,
+					},
+				},
+			},
+		},
+		{
+			Name: "nginx-agent-tls",
+			VolumeSource: corev1.VolumeSource{
+				Secret: &corev1.SecretVolumeSource{
+					SecretName: names.agentTLS,
+				},
+			},
+		},
+		{Name: "nginx-agent-log", VolumeSource: emptyDirVolumeSource},
+		{Name: "nginx-agent-lib", VolumeSource: emptyDirVolumeSource},
+		{Name: "nginx-conf", VolumeSource: emptyDirVolumeSource},
+		{Name: "nginx-stream-conf", VolumeSource: emptyDirVolumeSource},
+		{Name: "nginx-main-includes", VolumeSource: emptyDirVolumeSource},
+		{Name: "nginx-events-includes", VolumeSource: emptyDirVolumeSource},
+		{Name: "nginx-secrets", VolumeSource: emptyDirVolumeSource},
+		{Name: "nginx-run", VolumeSource: emptyDirVolumeSource},
+		{Name: "nginx-cache", VolumeSource: emptyDirVolumeSource},
+		{Name: "nginx-includes", VolumeSource: emptyDirVolumeSource},
+		{
+			Name: "nginx-includes-bootstrap",
+			VolumeSource: corev1.VolumeSource{
+				ConfigMap: &corev1.ConfigMapVolumeSource{
+					LocalObjectReference: corev1.LocalObjectReference{
+						Name: names.nginxIncludesConfigMap,
+					},
+				},
+			},
+		},
+	}
+}
+
+// buildInitContainers builds the init containers.
+func (p *NginxProvisioner) buildInitContainers(nProxyCfg *graph.EffectiveNginxProxy) []corev1.Container {
+	_, pullPolicy := p.buildImage(nProxyCfg)
 
 	clusterID := "unknown"
 	if val, ok := p.cfg.AgentLabels["cluster-id"]; ok {
 		clusterID = val
 	}
 
-	spec := corev1.PodTemplateSpec{
+	return []corev1.Container{
+		{
+			Name:            "init",
+			Image:           p.cfg.GatewayPodConfig.Image,
+			ImagePullPolicy: pullPolicy,
+			Command: []string{
+				"/usr/bin/gateway",
+				"initialize",
+				"--source", "/agent/nginx-agent.conf",
+				"--destination", "/etc/nginx-agent",
+				"--source", "/includes/main.conf",
+				"--destination", "/etc/nginx/main-includes",
+				"--source", "/includes/events.conf",
+				"--destination", "/etc/nginx/events-includes",
+			},
+			Env: []corev1.EnvVar{
+				{
+					Name: "POD_UID",
+					ValueFrom: &corev1.EnvVarSource{
+						FieldRef: &corev1.ObjectFieldSelector{
+							FieldPath: "metadata.uid",
+						},
+					},
+				},
+				{
+					Name:  "CLUSTER_UID",
+					Value: clusterID,
+				},
+			},
+			VolumeMounts: []corev1.VolumeMount{
+				{MountPath: "/agent", Name: "nginx-agent-config"},
+				{MountPath: "/etc/nginx-agent", Name: "nginx-agent"},
+				{MountPath: "/includes", Name: "nginx-includes-bootstrap"},
+				{MountPath: "/etc/nginx/main-includes", Name: "nginx-main-includes"},
+				{MountPath: "/etc/nginx/events-includes", Name: "nginx-events-includes"},
+			},
+			SecurityContext: &corev1.SecurityContext{
+				Capabilities: &corev1.Capabilities{
+					Drop: []corev1.Capability{"ALL"},
+				},
+				AllowPrivilegeEscalation: helpers.GetPointer(false),
+				ReadOnlyRootFilesystem:   helpers.GetPointer(true),
+				RunAsGroup:               helpers.GetPointer[int64](1001),
+				RunAsUser:                helpers.GetPointer[int64](101),
+				SeccompProfile: &corev1.SeccompProfile{
+					Type: corev1.SeccompProfileTypeRuntimeDefault,
+				},
+			},
+		},
+	}
+}
+
+// buildBasePodTemplateSpec builds the base pod template spec.
+func (p *NginxProvisioner) buildBasePodTemplateSpec(
+	objectMeta metav1.ObjectMeta,
+	podAnnotations map[string]string,
+	containers []corev1.Container,
+	initContainers []corev1.Container,
+	volumes []corev1.Volume,
+) corev1.PodTemplateSpec {
+	return corev1.PodTemplateSpec{
 		ObjectMeta: metav1.ObjectMeta{
 			Labels:      objectMeta.Labels,
 			Annotations: podAnnotations,
 		},
 		Spec: corev1.PodSpec{
-			Containers: []corev1.Container{
-				{
-					Name:            "nginx",
-					Image:           image,
-					ImagePullPolicy: pullPolicy,
-					Ports:           containerPorts,
-					ReadinessProbe:  p.buildReadinessProbe(nProxyCfg),
-					SecurityContext: &corev1.SecurityContext{
-						AllowPrivilegeEscalation: helpers.GetPointer(false),
-						Capabilities: &corev1.Capabilities{
-							Drop: []corev1.Capability{"ALL"},
-						},
-						ReadOnlyRootFilesystem: helpers.GetPointer(true),
-						RunAsGroup:             helpers.GetPointer[int64](1001),
-						RunAsUser:              helpers.GetPointer[int64](101),
-						SeccompProfile: &corev1.SeccompProfile{
-							Type: corev1.SeccompProfileTypeRuntimeDefault,
-						},
-					},
-					VolumeMounts: []corev1.VolumeMount{
-						{MountPath: "/etc/nginx-agent", Name: "nginx-agent"},
-						{MountPath: "/var/run/secrets/ngf", Name: "nginx-agent-tls"},
-						{MountPath: "/var/run/secrets/ngf/serviceaccount", Name: "token"},
-						{MountPath: "/var/log/nginx-agent", Name: "nginx-agent-log"},
-						{MountPath: "/var/lib/nginx-agent", Name: "nginx-agent-lib"},
-						{MountPath: "/etc/nginx/conf.d", Name: "nginx-conf"},
-						{MountPath: "/etc/nginx/stream-conf.d", Name: "nginx-stream-conf"},
-						{MountPath: "/etc/nginx/main-includes", Name: "nginx-main-includes"},
-						{MountPath: "/etc/nginx/events-includes", Name: "nginx-events-includes"},
-						{MountPath: "/etc/nginx/secrets", Name: "nginx-secrets"},
-						{MountPath: "/var/run/nginx", Name: "nginx-run"},
-						{MountPath: "/var/cache/nginx", Name: "nginx-cache"},
-						{MountPath: "/etc/nginx/includes", Name: "nginx-includes"},
-					},
-				},
-			},
-			InitContainers: []corev1.Container{
-				{
-					Name:            "init",
-					Image:           p.cfg.GatewayPodConfig.Image,
-					ImagePullPolicy: pullPolicy,
-					Command: []string{
-						"/usr/bin/gateway",
-						"initialize",
-						"--source", "/agent/nginx-agent.conf",
-						"--destination", "/etc/nginx-agent",
-						"--source", "/includes/main.conf",
-						"--destination", "/etc/nginx/main-includes",
-						"--source", "/includes/events.conf",
-						"--destination", "/etc/nginx/events-includes",
-					},
-					Env: []corev1.EnvVar{
-						{
-							Name: "POD_UID",
-							ValueFrom: &corev1.EnvVarSource{
-								FieldRef: &corev1.ObjectFieldSelector{
-									FieldPath: "metadata.uid",
-								},
-							},
-						},
-						{
-							Name:  "CLUSTER_UID",
-							Value: clusterID,
-						},
-					},
-					VolumeMounts: []corev1.VolumeMount{
-						{MountPath: "/agent", Name: "nginx-agent-config"},
-						{MountPath: "/etc/nginx-agent", Name: "nginx-agent"},
-						{MountPath: "/includes", Name: "nginx-includes-bootstrap"},
-						{MountPath: "/etc/nginx/main-includes", Name: "nginx-main-includes"},
-						{MountPath: "/etc/nginx/events-includes", Name: "nginx-events-includes"},
-					},
-					SecurityContext: &corev1.SecurityContext{
-						AllowPrivilegeEscalation: helpers.GetPointer(false),
-						Capabilities: &corev1.Capabilities{
-							Drop: []corev1.Capability{"ALL"},
-						},
-						ReadOnlyRootFilesystem: helpers.GetPointer(true),
-						RunAsGroup:             helpers.GetPointer[int64](1001),
-						RunAsUser:              helpers.GetPointer[int64](101),
-						SeccompProfile: &corev1.SeccompProfile{
-							Type: corev1.SeccompProfileTypeRuntimeDefault,
-						},
-					},
-				},
-			},
-			ImagePullSecrets:   []corev1.LocalObjectReference{},
-			ServiceAccountName: objectMeta.Name,
+			AutomountServiceAccountToken: helpers.GetPointer(true),
+			Containers:                   containers,
+			InitContainers:               initContainers,
+			ImagePullSecrets:             []corev1.LocalObjectReference{},
+			ServiceAccountName:           objectMeta.Name,
 			SecurityContext: &corev1.PodSecurityContext{
 				FSGroup:      helpers.GetPointer[int64](1001),
 				RunAsNonRoot: helpers.GetPointer(true),
@@ -1112,112 +1352,72 @@ func (p *NginxProvisioner) buildNginxPodTemplateSpec(
 					},
 				},
 			},
-			Volumes: []corev1.Volume{
-				{
-					Name: "token",
-					VolumeSource: corev1.VolumeSource{
-						Projected: &corev1.ProjectedVolumeSource{
-							Sources: []corev1.VolumeProjection{
-								{
-									ServiceAccountToken: &corev1.ServiceAccountTokenProjection{
-										Path:     "token",
-										Audience: tokenAudience,
-									},
-								},
-							},
-						},
-					},
-				},
-				{Name: "nginx-agent", VolumeSource: emptyDirVolumeSource},
-				{
-					Name: "nginx-agent-config",
-					VolumeSource: corev1.VolumeSource{
-						ConfigMap: &corev1.ConfigMapVolumeSource{
-							LocalObjectReference: corev1.LocalObjectReference{
-								Name: names.nginxAgentConfigMap,
-							},
-						},
-					},
-				},
-				{
-					Name: "nginx-agent-tls",
-					VolumeSource: corev1.VolumeSource{
-						Secret: &corev1.SecretVolumeSource{
-							SecretName: names.agentTLS,
-						},
-					},
-				},
-				{Name: "nginx-agent-log", VolumeSource: emptyDirVolumeSource},
-				{Name: "nginx-agent-lib", VolumeSource: emptyDirVolumeSource},
-				{Name: "nginx-conf", VolumeSource: emptyDirVolumeSource},
-				{Name: "nginx-stream-conf", VolumeSource: emptyDirVolumeSource},
-				{Name: "nginx-main-includes", VolumeSource: emptyDirVolumeSource},
-				{Name: "nginx-events-includes", VolumeSource: emptyDirVolumeSource},
-				{Name: "nginx-secrets", VolumeSource: emptyDirVolumeSource},
-				{Name: "nginx-run", VolumeSource: emptyDirVolumeSource},
-				{Name: "nginx-cache", VolumeSource: emptyDirVolumeSource},
-				{Name: "nginx-includes", VolumeSource: emptyDirVolumeSource},
-				{
-					Name: "nginx-includes-bootstrap",
-					VolumeSource: corev1.VolumeSource{
-						ConfigMap: &corev1.ConfigMapVolumeSource{
-							LocalObjectReference: corev1.LocalObjectReference{
-								Name: names.nginxIncludesConfigMap,
-							},
-						},
-					},
-				},
-			},
+			Volumes: volumes,
 		},
 	}
+}
 
-	var containerResources corev1.ResourceRequirements
-	if nProxyCfg != nil && nProxyCfg.Kubernetes != nil {
-		var podSpec *ngfAPIv1alpha2.PodSpec
-		var containerSpec *ngfAPIv1alpha2.ContainerSpec
-		if nProxyCfg.Kubernetes.Deployment != nil {
-			podSpec = &nProxyCfg.Kubernetes.Deployment.Pod
-			containerSpec = &nProxyCfg.Kubernetes.Deployment.Container
-		} else if nProxyCfg.Kubernetes.DaemonSet != nil {
-			podSpec = &nProxyCfg.Kubernetes.DaemonSet.Pod
-			containerSpec = &nProxyCfg.Kubernetes.DaemonSet.Container
-		}
-
-		if podSpec != nil {
-			spec.Spec.TerminationGracePeriodSeconds = podSpec.TerminationGracePeriodSeconds
-			spec.Spec.Affinity = podSpec.Affinity
-			spec.Spec.NodeSelector = podSpec.NodeSelector
-			spec.Spec.Tolerations = podSpec.Tolerations
-			spec.Spec.Volumes = append(spec.Spec.Volumes, podSpec.Volumes...)
-			spec.Spec.TopologySpreadConstraints = podSpec.TopologySpreadConstraints
-		}
-
-		if containerSpec != nil {
-			container := spec.Spec.Containers[0]
-			if containerSpec.Resources != nil {
-				containerResources = *containerSpec.Resources
-				container.Resources = containerResources
-			}
-			container.Lifecycle = containerSpec.Lifecycle
-			container.VolumeMounts = append(container.VolumeMounts, containerSpec.VolumeMounts...)
-
-			if containerSpec.Debug != nil && *containerSpec.Debug {
-				container.Command = append(container.Command, "/agent/entrypoint.sh")
-				container.Args = append(container.Args, "debug")
-			}
-
-			for _, hostPort := range containerSpec.HostPorts {
-				for i, port := range container.Ports {
-					if hostPort.ContainerPort == port.ContainerPort {
-						container.Ports[i].HostPort = hostPort.Port
-					}
-				}
-			}
-
-			spec.Spec.Containers[0] = container
-		}
+// applyUserConfiguration applies user-defined configuration overrides.
+func (p *NginxProvisioner) applyUserConfiguration(
+	spec *corev1.PodTemplateSpec,
+	nProxyCfg *graph.EffectiveNginxProxy,
+) {
+	if nProxyCfg == nil || nProxyCfg.Kubernetes == nil {
+		return
 	}
 
+	var podSpec *ngfAPIv1alpha2.PodSpec
+	var containerSpec *ngfAPIv1alpha2.ContainerSpec
+
+	if nProxyCfg.Kubernetes.Deployment != nil {
+		podSpec = &nProxyCfg.Kubernetes.Deployment.Pod
+		containerSpec = &nProxyCfg.Kubernetes.Deployment.Container
+	} else if nProxyCfg.Kubernetes.DaemonSet != nil {
+		podSpec = &nProxyCfg.Kubernetes.DaemonSet.Pod
+		containerSpec = &nProxyCfg.Kubernetes.DaemonSet.Container
+	}
+
+	// Apply pod-level configuration
+	if podSpec != nil {
+		spec.Spec.TerminationGracePeriodSeconds = podSpec.TerminationGracePeriodSeconds
+		spec.Spec.Affinity = podSpec.Affinity
+		spec.Spec.NodeSelector = podSpec.NodeSelector
+		spec.Spec.Tolerations = podSpec.Tolerations
+		spec.Spec.Volumes = append(spec.Spec.Volumes, podSpec.Volumes...)
+		spec.Spec.TopologySpreadConstraints = podSpec.TopologySpreadConstraints
+	}
+
+	// Apply container-level configuration (NGINX container only)
+	if containerSpec != nil {
+		container := spec.Spec.Containers[0]
+		if containerSpec.Resources != nil {
+			container.Resources = *containerSpec.Resources
+		}
+		container.Lifecycle = containerSpec.Lifecycle
+		container.VolumeMounts = append(container.VolumeMounts, containerSpec.VolumeMounts...)
+
+		if containerSpec.Debug != nil && *containerSpec.Debug {
+			container.Command = append(container.Command, "/agent/entrypoint.sh")
+			container.Args = append(container.Args, "debug")
+		}
+
+		for _, hostPort := range containerSpec.HostPorts {
+			for i, port := range container.Ports {
+				if hostPort.ContainerPort == port.ContainerPort {
+					container.Ports[i].HostPort = hostPort.Port
+				}
+			}
+		}
+
+		spec.Spec.Containers[0] = container
+	}
+}
+
+// configureImagePullSecrets configures image pull secrets.
+func (p *NginxProvisioner) configureImagePullSecrets(
+	spec *corev1.PodTemplateSpec,
+	names resourceNames,
+) {
 	for name := range names.dockerSecrets {
 		ref := corev1.LocalObjectReference{Name: name}
 		spec.Spec.ImagePullSecrets = append(spec.Spec.ImagePullSecrets, ref)
@@ -1228,123 +1428,140 @@ func (p *NginxProvisioner) buildNginxPodTemplateSpec(
 	sort.Slice(spec.Spec.ImagePullSecrets, func(i, j int) bool {
 		return spec.Spec.ImagePullSecrets[i].Name < spec.Spec.ImagePullSecrets[j].Name
 	})
+}
 
-	if p.cfg.Plus {
-		initCmd := spec.Spec.InitContainers[0].Command
-		initCmd = append(initCmd,
-			"--source", "/includes/mgmt.conf", "--destination", "/etc/nginx/main-includes", "--nginx-plus")
-		spec.Spec.InitContainers[0].Command = initCmd
+// configureNginxPlus configures NGINX Plus specific settings.
+func (p *NginxProvisioner) configureNginxPlus(
+	spec *corev1.PodTemplateSpec,
+	names resourceNames,
+) {
+	// Update init container command
+	initCmd := spec.Spec.InitContainers[0].Command
+	initCmd = append(initCmd,
+		"--source", "/includes/mgmt.conf",
+		"--destination", "/etc/nginx/main-includes",
+		"--nginx-plus",
+	)
+	spec.Spec.InitContainers[0].Command = initCmd
 
-		volumeMounts := spec.Spec.Containers[0].VolumeMounts
+	// Add NGINX Plus volumes and volume mounts
+	volumeMounts := spec.Spec.Containers[0].VolumeMounts
 
+	// Add nginx-lib volume
+	volumeMounts = append(volumeMounts, corev1.VolumeMount{
+		Name:      "nginx-lib",
+		MountPath: "/var/lib/nginx/state",
+	})
+	spec.Spec.Volumes = append(spec.Spec.Volumes, corev1.Volume{
+		Name:         "nginx-lib",
+		VolumeSource: emptyDirVolumeSource,
+	})
+
+	// Add JWT license if configured
+	if names.jwt != "" {
 		volumeMounts = append(volumeMounts, corev1.VolumeMount{
-			Name:      "nginx-lib",
-			MountPath: "/var/lib/nginx/state",
+			Name:      "nginx-plus-license",
+			MountPath: "/etc/nginx/" + secrets.LicenseJWTKey,
+			SubPath:   secrets.LicenseJWTKey,
 		})
 		spec.Spec.Volumes = append(spec.Spec.Volumes, corev1.Volume{
-			Name:         "nginx-lib",
-			VolumeSource: emptyDirVolumeSource,
+			Name:         "nginx-plus-license",
+			VolumeSource: corev1.VolumeSource{Secret: &corev1.SecretVolumeSource{SecretName: names.jwt}},
+		})
+	}
+
+	// Add usage certs if configured
+	if names.ca != "" || names.clientSSL != "" {
+		volumeMounts = append(volumeMounts, corev1.VolumeMount{
+			Name:      "nginx-plus-usage-certs",
+			MountPath: "/etc/nginx/certs-bootstrap/",
 		})
 
-		if names.jwt != "" {
-			volumeMounts = append(volumeMounts, corev1.VolumeMount{
-				Name:      "nginx-plus-license",
-				MountPath: "/etc/nginx/" + secrets.LicenseJWTKey,
-				SubPath:   secrets.LicenseJWTKey,
-			})
-			spec.Spec.Volumes = append(spec.Spec.Volumes, corev1.Volume{
-				Name:         "nginx-plus-license",
-				VolumeSource: corev1.VolumeSource{Secret: &corev1.SecretVolumeSource{SecretName: names.jwt}},
+		sources := []corev1.VolumeProjection{}
+		if names.ca != "" {
+			sources = append(sources, corev1.VolumeProjection{
+				Secret: &corev1.SecretProjection{
+					LocalObjectReference: corev1.LocalObjectReference{Name: names.ca},
+				},
 			})
 		}
-		if names.ca != "" || names.clientSSL != "" {
-			volumeMounts = append(volumeMounts, corev1.VolumeMount{
-				Name:      "nginx-plus-usage-certs",
-				MountPath: "/etc/nginx/certs-bootstrap/",
-			})
-
-			sources := []corev1.VolumeProjection{}
-
-			if names.ca != "" {
-				sources = append(sources, corev1.VolumeProjection{
-					Secret: &corev1.SecretProjection{
-						LocalObjectReference: corev1.LocalObjectReference{Name: names.ca},
-					},
-				})
-			}
-
-			if names.clientSSL != "" {
-				sources = append(sources, corev1.VolumeProjection{
-					Secret: &corev1.SecretProjection{
-						LocalObjectReference: corev1.LocalObjectReference{Name: names.clientSSL},
-					},
-				})
-			}
-
-			spec.Spec.Volumes = append(spec.Spec.Volumes, corev1.Volume{
-				Name: "nginx-plus-usage-certs",
-				VolumeSource: corev1.VolumeSource{
-					Projected: &corev1.ProjectedVolumeSource{
-						Sources: sources,
-					},
+		if names.clientSSL != "" {
+			sources = append(sources, corev1.VolumeProjection{
+				Secret: &corev1.SecretProjection{
+					LocalObjectReference: corev1.LocalObjectReference{Name: names.clientSSL},
 				},
 			})
 		}
 
-		spec.Spec.Containers[0].VolumeMounts = volumeMounts
-	}
-
-	if p.cfg.NginxOneConsoleTelemetryConfig.DataplaneKeySecretName != "" {
-		volumeMounts := spec.Spec.Containers[0].VolumeMounts
-
-		volumeMounts = append(volumeMounts, corev1.VolumeMount{
-			Name:      "agent-dataplane-key",
-			MountPath: "/etc/nginx-agent/secrets/dataplane.key",
-			SubPath:   "dataplane.key",
-		})
 		spec.Spec.Volumes = append(spec.Spec.Volumes, corev1.Volume{
-			Name:         "agent-dataplane-key",
-			VolumeSource: corev1.VolumeSource{Secret: &corev1.SecretVolumeSource{SecretName: names.dataplaneKey}},
-		})
-
-		spec.Spec.Containers[0].VolumeMounts = volumeMounts
-	}
-
-	if p.cfg.InferenceExtension {
-		command := []string{
-			"/usr/bin/gateway",
-			"endpoint-picker",
-		}
-
-		if p.cfg.EndpointPickerDisableTLS {
-			command = append(command, "--endpoint-picker-disable-tls")
-		}
-		if p.cfg.EndpointPickerTLSSkipVerify {
-			command = append(command, "--endpoint-picker-tls-skip-verify")
-		}
-
-		spec.Spec.Containers = append(spec.Spec.Containers, corev1.Container{
-			Name:            "endpoint-picker-shim",
-			Image:           p.cfg.GatewayPodConfig.Image,
-			ImagePullPolicy: pullPolicy,
-			Command:         command,
-			Resources:       containerResources,
-			SecurityContext: &corev1.SecurityContext{
-				AllowPrivilegeEscalation: helpers.GetPointer(false),
-				Capabilities: &corev1.Capabilities{
-					Drop: []corev1.Capability{"ALL"},
-				},
-				ReadOnlyRootFilesystem: helpers.GetPointer(true),
-				RunAsGroup:             helpers.GetPointer[int64](1001),
-				RunAsUser:              helpers.GetPointer[int64](101),
-				SeccompProfile: &corev1.SeccompProfile{
-					Type: corev1.SeccompProfileTypeRuntimeDefault,
+			Name: "nginx-plus-usage-certs",
+			VolumeSource: corev1.VolumeSource{
+				Projected: &corev1.ProjectedVolumeSource{
+					Sources: sources,
 				},
 			},
 		})
 	}
 
-	return spec
+	spec.Spec.Containers[0].VolumeMounts = volumeMounts
+}
+
+// configureDataplaneKeySecret configures the dataplane key secret for NGINX One Console telemetry.
+func (p *NginxProvisioner) configureDataplaneKeySecret(
+	spec *corev1.PodTemplateSpec,
+	names resourceNames,
+) {
+	volumeMounts := spec.Spec.Containers[0].VolumeMounts
+
+	volumeMounts = append(volumeMounts, corev1.VolumeMount{
+		Name:      "agent-dataplane-key",
+		MountPath: "/etc/nginx-agent/secrets/dataplane.key",
+		SubPath:   "dataplane.key",
+	})
+	spec.Spec.Volumes = append(spec.Spec.Volumes, corev1.Volume{
+		Name:         "agent-dataplane-key",
+		VolumeSource: corev1.VolumeSource{Secret: &corev1.SecretVolumeSource{SecretName: names.dataplaneKey}},
+	})
+
+	spec.Spec.Containers[0].VolumeMounts = volumeMounts
+}
+
+// configureInferenceExtension configures the inference extension endpoint-picker sidecar.
+func (p *NginxProvisioner) configureInferenceExtension(
+	spec *corev1.PodTemplateSpec,
+	containerResources corev1.ResourceRequirements,
+) {
+	command := []string{
+		"/usr/bin/gateway",
+		"endpoint-picker",
+	}
+
+	if p.cfg.EndpointPickerDisableTLS {
+		command = append(command, "--endpoint-picker-disable-tls")
+	}
+	if p.cfg.EndpointPickerTLSSkipVerify {
+		command = append(command, "--endpoint-picker-tls-skip-verify")
+	}
+
+	spec.Spec.Containers = append(spec.Spec.Containers, corev1.Container{
+		Name:            "endpoint-picker-shim",
+		Image:           p.cfg.GatewayPodConfig.Image,
+		ImagePullPolicy: defaultImagePullPolicy,
+		Command:         command,
+		Resources:       containerResources,
+		SecurityContext: &corev1.SecurityContext{
+			AllowPrivilegeEscalation: helpers.GetPointer(false),
+			Capabilities: &corev1.Capabilities{
+				Drop: []corev1.Capability{"ALL"},
+			},
+			ReadOnlyRootFilesystem: helpers.GetPointer(true),
+			RunAsGroup:             helpers.GetPointer[int64](1001),
+			RunAsUser:              helpers.GetPointer[int64](101),
+			SeccompProfile: &corev1.SeccompProfile{
+				Type: corev1.SeccompProfileTypeRuntimeDefault,
+			},
+		},
+	})
 }
 
 func (p *NginxProvisioner) buildImage(nProxyCfg *graph.EffectiveNginxProxy) (string, corev1.PullPolicy) {
@@ -1355,10 +1572,6 @@ func buildNginxDeploymentHPA(
 	objectMeta metav1.ObjectMeta,
 	autoScaling *ngfAPIv1alpha2.AutoscalingSpec,
 ) *autoscalingv2.HorizontalPodAutoscaler {
-	if !autoScaling.Enable {
-		return nil
-	}
-
 	cpuUtil := autoScaling.TargetCPUUtilizationPercentage
 	memUtil := autoScaling.TargetMemoryUtilizationPercentage
 
@@ -1416,6 +1629,235 @@ func buildNginxDeploymentHPA(
 	}
 }
 
+// configureWAF configures WAF containers, volume mounts, and volumes.
+func (p *NginxProvisioner) configureWAF(
+	containers []corev1.Container,
+	volumes []corev1.Volume,
+	nProxyCfg *graph.EffectiveNginxProxy,
+) ([]corev1.Container, []corev1.Volume) {
+	// Add WAF containers
+	wafContainers := p.buildWAFContainers(nProxyCfg)
+	containers = append(containers, wafContainers...)
+
+	// Add WAF volume mounts to NGINX container
+	nginxContainer := containers[0]
+	nginxContainer.VolumeMounts = append(nginxContainer.VolumeMounts, buildNginxWAFVolumeMounts()...)
+	containers[0] = nginxContainer
+
+	// Add WAF volumes
+	wafVolumes := buildWAFSharedVolumes()
+	volumes = append(volumes, wafVolumes...)
+
+	return containers, volumes
+}
+
+// buildWAFSharedVolumes creates the required shared volumes for WAF containers.
+func buildWAFSharedVolumes() []corev1.Volume {
+	return []corev1.Volume{
+		{
+			Name:         appProtectBundlesVolumeName,
+			VolumeSource: emptyDirVolumeSource,
+		},
+		{
+			Name:         appProtectConfigVolumeName,
+			VolumeSource: emptyDirVolumeSource,
+		},
+		{
+			Name:         appProtectBdConfigVolumeName,
+			VolumeSource: emptyDirVolumeSource,
+		},
+		{
+			Name:         appProtectLockVolumeName,
+			VolumeSource: emptyDirVolumeSource,
+		},
+	}
+}
+
+// buildNginxWAFVolumeMounts creates the required volume mounts for NGINX container when WAF is enabled.
+func buildNginxWAFVolumeMounts() []corev1.VolumeMount {
+	return []corev1.VolumeMount{
+		{
+			Name:      appProtectBundlesVolumeName,
+			MountPath: "/etc/app_protect/bundles",
+		},
+		{
+			Name:      appProtectConfigVolumeName,
+			MountPath: "/opt/app_protect/config",
+		},
+		{
+			Name:      appProtectBdConfigVolumeName,
+			MountPath: "/opt/app_protect/bd_config",
+		},
+		{
+			Name:      appProtectLockVolumeName,
+			MountPath: "/opt/app_protect/lock",
+		},
+	}
+}
+
+// buildWAFContainers creates the WAF enforcer and config manager containers.
+func (p *NginxProvisioner) buildWAFContainers(nProxyCfg *graph.EffectiveNginxProxy) []corev1.Container {
+	var containers []corev1.Container
+	var wafContainersCfg *ngfAPIv1alpha2.WAFContainerSpec
+
+	// Get WAF container configuration
+	if nProxyCfg != nil && nProxyCfg.Kubernetes != nil {
+		if nProxyCfg.Kubernetes.Deployment != nil {
+			wafContainersCfg = nProxyCfg.Kubernetes.Deployment.WAFContainers
+		} else if nProxyCfg.Kubernetes.DaemonSet != nil {
+			wafContainersCfg = nProxyCfg.Kubernetes.DaemonSet.WAFContainers
+		}
+	}
+
+	// Build WAF Enforcer container
+	enforcerContainer := p.buildWAFEnforcerContainer(wafContainersCfg)
+	containers = append(containers, enforcerContainer)
+
+	// Build WAF Config Manager container
+	configMgrContainer := p.buildWAFConfigManagerContainer(wafContainersCfg)
+	containers = append(containers, configMgrContainer)
+
+	return containers
+}
+
+// buildWAFEnforcerContainer creates the WAF enforcer container.
+func (p *NginxProvisioner) buildWAFEnforcerContainer(
+	wafContainersCfg *ngfAPIv1alpha2.WAFContainerSpec,
+) corev1.Container {
+	image := p.buildWAFImage(
+		defaultWAFEnforcerImagePath,
+		waf.Release,
+		wafContainersCfg,
+		"enforcer",
+	)
+
+	container := corev1.Container{
+		Name:            "waf-enforcer",
+		Image:           image,
+		ImagePullPolicy: defaultImagePullPolicy,
+		SecurityContext: &corev1.SecurityContext{
+			RunAsUser:                helpers.GetPointer[int64](101),
+			AllowPrivilegeEscalation: helpers.GetPointer(false),
+			RunAsNonRoot:             helpers.GetPointer(true),
+			ReadOnlyRootFilesystem:   helpers.GetPointer(true),
+			Capabilities: &corev1.Capabilities{
+				Drop: []corev1.Capability{"all"},
+			},
+		},
+		Env: []corev1.EnvVar{
+			{Name: "ENFORCER_PORT", Value: "50000"},
+			{Name: "ENFORCER_CONFIG_TIMEOUT", Value: "0"},
+		},
+		VolumeMounts: []corev1.VolumeMount{
+			{
+				Name:      appProtectBdConfigVolumeName,
+				MountPath: "/opt/app_protect/bd_config",
+			},
+		},
+	}
+
+	// Apply user-configured settings
+	if wafContainersCfg != nil && wafContainersCfg.Enforcer != nil {
+		if wafContainersCfg.Enforcer.Resources != nil {
+			container.Resources = *wafContainersCfg.Enforcer.Resources
+		}
+		if len(wafContainersCfg.Enforcer.VolumeMounts) > 0 {
+			container.VolumeMounts = append(container.VolumeMounts, wafContainersCfg.Enforcer.VolumeMounts...)
+		}
+	}
+
+	return container
+}
+
+// buildWAFConfigManagerContainer creates the WAF config manager container.
+func (p *NginxProvisioner) buildWAFConfigManagerContainer(
+	wafContainersCfg *ngfAPIv1alpha2.WAFContainerSpec,
+) corev1.Container {
+	image := p.buildWAFImage(
+		defaultWAFConfigMgrImagePath,
+		waf.Release,
+		wafContainersCfg,
+		"configManager",
+	)
+
+	container := corev1.Container{
+		Name:            "waf-config-mgr",
+		Image:           image,
+		ImagePullPolicy: defaultImagePullPolicy,
+		SecurityContext: &corev1.SecurityContext{
+			AllowPrivilegeEscalation: helpers.GetPointer(false),
+			RunAsNonRoot:             helpers.GetPointer(false),
+			RunAsUser:                helpers.GetPointer[int64](101),
+			ReadOnlyRootFilesystem:   helpers.GetPointer(true),
+			Capabilities: &corev1.Capabilities{
+				Drop: []corev1.Capability{"all"},
+			},
+		},
+		VolumeMounts: []corev1.VolumeMount{
+			{
+				Name:      appProtectBdConfigVolumeName,
+				MountPath: "/opt/app_protect/bd_config",
+			},
+			{
+				Name:      appProtectConfigVolumeName,
+				MountPath: "/opt/app_protect/config",
+			},
+			{
+				Name:      appProtectBundlesVolumeName,
+				MountPath: "/etc/app_protect/bundles",
+			},
+			{
+				Name:      appProtectLockVolumeName,
+				MountPath: "/opt/app_protect/lock",
+			},
+		},
+	}
+
+	// Apply user-configured settings
+	if wafContainersCfg != nil && wafContainersCfg.ConfigManager != nil {
+		if wafContainersCfg.ConfigManager.Resources != nil {
+			container.Resources = *wafContainersCfg.ConfigManager.Resources
+		}
+		if len(wafContainersCfg.ConfigManager.VolumeMounts) > 0 {
+			container.VolumeMounts = append(container.VolumeMounts, wafContainersCfg.ConfigManager.VolumeMounts...)
+		}
+	}
+
+	return container
+}
+
+// buildWAFImage builds the WAF container image string.
+func (p *NginxProvisioner) buildWAFImage(
+	defaultImagePath,
+	defaultTag string,
+	wafContainersCfg *ngfAPIv1alpha2.WAFContainerSpec,
+	containerType string,
+) string {
+	image := defaultImagePath
+	tag := defaultTag
+
+	if wafContainersCfg != nil {
+		var containerCfg *ngfAPIv1alpha2.WAFContainerConfig
+		switch containerType {
+		case "enforcer":
+			containerCfg = wafContainersCfg.Enforcer
+		case "configManager":
+			containerCfg = wafContainersCfg.ConfigManager
+		}
+
+		if containerCfg != nil && containerCfg.Image != nil {
+			if containerCfg.Image.Repository != nil {
+				image = *containerCfg.Image.Repository
+			}
+			if containerCfg.Image.Tag != nil {
+				tag = *containerCfg.Image.Tag
+			}
+		}
+	}
+
+	return fmt.Sprintf("%s:%s", image, tag)
+}
+
 // TODO(sberman): see about how this can be made more elegant. Maybe create some sort of Object factory
 // that can better store/build all the objects we need, to reduce the amount of duplicate object lists that we
 // have everywhere.
@@ -1425,11 +1867,12 @@ func (p *NginxProvisioner) buildResourcesForInvalidGatewayCleanup(
 	// Order to delete:
 	// 1. deployment/daemonset
 	// 2. service
-	// 3. hpa
-	// 4. role/binding (if openshift)
-	// 5. serviceaccount
-	// 6. configmaps
-	// 7. secrets
+	// 3. hpa (Horizontal Pod Autoscaler)
+	// 4. pdb (Pod Disruption Budget)
+	// 5. role/binding (if openshift)
+	// 6. serviceaccount
+	// 7. configmaps
+	// 8. secrets
 
 	var objects []client.Object
 
@@ -1458,7 +1901,10 @@ func (p *NginxProvisioner) buildResourcesForInvalidGatewayCleanup(
 	// 3. HPA
 	objects = append(objects, &autoscalingv2.HorizontalPodAutoscaler{ObjectMeta: baseMeta})
 
-	// 4. OpenShift Role/RoleBinding
+	// 4. PDB
+	objects = append(objects, &policyv1.PodDisruptionBudget{ObjectMeta: baseMeta})
+
+	// 5. OpenShift Role/RoleBinding
 	if p.isOpenshift {
 		objects = append(objects,
 			&rbacv1.Role{ObjectMeta: baseMeta},
@@ -1466,16 +1912,16 @@ func (p *NginxProvisioner) buildResourcesForInvalidGatewayCleanup(
 		)
 	}
 
-	// 5. ServiceAccount
+	// 6. ServiceAccount
 	objects = append(objects, &corev1.ServiceAccount{ObjectMeta: baseMeta})
 
-	// 6. ConfigMaps
+	// 7. ConfigMaps
 	objects = append(objects,
 		&corev1.ConfigMap{ObjectMeta: meta(resourceName(nginxIncludesConfigMapNameSuffix))},
 		&corev1.ConfigMap{ObjectMeta: meta(resourceName(nginxAgentConfigMapNameSuffix))},
 	)
 
-	// 7. Secrets
+	// 8. Secrets
 	objects = append(objects, &corev1.Secret{ObjectMeta: meta(resourceName(p.cfg.AgentTLSSecretName))})
 
 	for _, name := range p.cfg.NginxDockerSecretNames {
@@ -1555,12 +2001,10 @@ func isNginxReadinessProbeExposed(nProxyCfg *graph.EffectiveNginxProxy) bool {
 
 func DetermineNginxImageName(
 	nProxyCfg *graph.EffectiveNginxProxy,
-	isPlus bool, version string,
+	isPlus bool,
+	version string,
 ) (string, corev1.PullPolicy) {
 	image := defaultNginxImagePath
-	if isPlus {
-		image = defaultNginxPlusImagePath
-	}
 	tag := version
 	pullPolicy := defaultImagePullPolicy
 
@@ -1585,6 +2029,17 @@ func DetermineNginxImageName(
 			image, tag, pullPolicy = getImageAndPullPolicy(nProxyCfg.Kubernetes.Deployment.Container)
 		} else if nProxyCfg.Kubernetes.DaemonSet != nil {
 			image, tag, pullPolicy = getImageAndPullPolicy(nProxyCfg.Kubernetes.DaemonSet.Container)
+		}
+	}
+
+	// If Plus is enabled and the resolved image is still the OSS default (either because
+	// no override was specified, or because the Helm chart unconditionally injects the OSS
+	// default into the NginxProxy), correct it to the appropriate Plus image.
+	if isPlus && image == defaultNginxImagePath {
+		if graph.WAFEnabledForNginxProxy(nProxyCfg) {
+			image = defaultNginxPlusWAFImagePath
+		} else {
+			image = defaultNginxPlusImagePath
 		}
 	}
 

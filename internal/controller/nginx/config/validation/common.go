@@ -7,7 +7,7 @@ import (
 	"strings"
 	"time"
 
-	"github.com/dlclark/regexp2"
+	"github.com/dlclark/regexp2/v2"
 	k8svalidation "k8s.io/apimachinery/pkg/util/validation"
 )
 
@@ -17,9 +17,41 @@ const (
 )
 
 var (
-	pathRegexp   = regexp2.MustCompile("^"+pathFmt+"$", 0)
+	pathRegexp   = regexp2.MustCompile("^"+pathFmt+"$", regexp2.None)
 	pathExamples = []string{"/", "/path", "/path/subpath-123"}
 )
+
+const (
+	singleQuotedStringFmt    = `[^']*`
+	singleQuotedStringErrMsg = `must not contain single quotes (')`
+	lineBreakErrMsg          = "must not contain line breaks"
+)
+
+var singleQuotedStringFmtRegexp = regexp.MustCompile("^" + singleQuotedStringFmt + "$")
+
+// validateSingleQuotedString validates a string that will be placed inside single quotes
+// in the NGINX config. Single quotes cannot be escaped in NGINX single-quoted strings,
+// so they must not be present.
+// If the value is invalid, the function returns an error that includes the specified examples of valid values.
+func validateSingleQuotedString(value string, examples []string) error {
+	if err := validateNoLineBreaks(value); err != nil {
+		return err
+	}
+
+	if !singleQuotedStringFmtRegexp.MatchString(value) {
+		msg := k8svalidation.RegexError(singleQuotedStringErrMsg, singleQuotedStringFmt, examples...)
+		return errors.New(msg)
+	}
+	return nil
+}
+
+func validateNoLineBreaks(value string) error {
+	if strings.ContainsAny(value, "\r\n") {
+		return errors.New(lineBreakErrMsg)
+	}
+
+	return nil
+}
 
 const (
 	escapedStringsFmt    = `([^"\\]|\\.)*`
@@ -34,6 +66,10 @@ var escapedStringsFmtRegexp = regexp.MustCompile("^" + escapedStringsFmt + "$")
 // For example, server_name "hello $not_a_var world"
 // If the value is invalid, the function returns an error that includes the specified examples of valid values.
 func validateEscapedString(value string, examples []string) error {
+	if err := validateNoLineBreaks(value); err != nil {
+		return err
+	}
+
 	if !escapedStringsFmtRegexp.MatchString(value) {
 		msg := k8svalidation.RegexError(escapedStringsErrMsg, escapedStringsFmt, examples...)
 		return errors.New(msg)
@@ -53,6 +89,10 @@ var escapedStringsNoVarExpansionFmtRegexp = regexp.MustCompile("^" + escapedStri
 // prevent variable expansion.
 // If the value is invalid, the function returns an error that includes the specified examples of valid values.
 func validateEscapedStringNoVarExpansion(value string, examples []string) error {
+	if err := validateNoLineBreaks(value); err != nil {
+		return err
+	}
+
 	if !escapedStringsNoVarExpansionFmtRegexp.MatchString(value) {
 		msg := k8svalidation.RegexError(
 			escapedStringsNoVarExpansionErrMsg,

@@ -27,6 +27,11 @@ trap 'handle_quit' QUIT
 
 rm -rf /var/run/nginx/*.sock
 
+# Bootstrap the necessary app protect files
+if [ "${USE_NAP_WAF:-false}" = "true" ]; then
+    touch /opt/app_protect/bd_config/policy_path.map
+fi
+
 # Launch nginx
 echo "starting nginx ..."
 
@@ -50,7 +55,7 @@ done
 
 # start nginx-agent, pass args
 echo "starting nginx-agent ..."
-nginx-agent &
+GOMEMLIMIT=150MiB GOGC=75 nginx-agent &
 
 agent_pid=$!
 

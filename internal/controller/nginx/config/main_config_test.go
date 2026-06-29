@@ -57,22 +57,92 @@ func TestExecuteMainConfig_Telemetry(t *testing.T) {
 	}
 }
 
-func TestExecuteMainConfig_Logging(t *testing.T) {
+func TestExecuteMainConfig_Waf(t *testing.T) {
 	t.Parallel()
 
-	conf := dataplane.Configuration{
-		Logging: dataplane.Logging{
-			ErrorLevel: "info",
+	wafOff := dataplane.Configuration{
+		WAF: dataplane.WAFConfig{
+			Enabled: false,
+		},
+	}
+	wafOn := dataplane.Configuration{
+		WAF: dataplane.WAFConfig{
+			Enabled: true,
+		},
+	}
+	loadModuleDirective := "load_module modules/ngx_http_app_protect_module.so;"
+
+	tests := []struct {
+		name                   string
+		conf                   dataplane.Configuration
+		expLoadModuleDirective bool
+	}{
+		{
+			name:                   "waf off",
+			conf:                   wafOff,
+			expLoadModuleDirective: false,
+		},
+		{
+			name:                   "waf on",
+			conf:                   wafOn,
+			expLoadModuleDirective: true,
 		},
 	}
 
-	g := NewWithT(t)
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			t.Parallel()
+			g := NewWithT(t)
 
-	res := executeMainConfig(conf, &policiesfakes.FakeGenerator{})
-	g.Expect(res).To(HaveLen(1))
-	g.Expect(res[0].dest).To(Equal(mainIncludesConfigFile))
+			res := executeMainConfig(test.conf, &policiesfakes.FakeGenerator{})
+			g.Expect(res).To(HaveLen(1))
+			g.Expect(res[0].dest).To(Equal(mainIncludesConfigFile))
+			if test.expLoadModuleDirective {
+				g.Expect(res[0].data).To(ContainSubstring(loadModuleDirective))
+			} else {
+				g.Expect(res[0].data).ToNot(ContainSubstring(loadModuleDirective))
+			}
+		})
+	}
+}
 
-	g.Expect(string(res[0].data)).To(ContainSubstring("error_log stderr info"))
+func TestExecuteMainConfig_Logging(t *testing.T) {
+	t.Parallel()
+
+	tests := []struct {
+		name         string
+		expDirective string
+		logging      dataplane.Logging
+		expectJSON   bool
+	}{
+		{
+			name:         "error log uses default text format when JSON is false",
+			logging:      dataplane.Logging{ErrorLevel: "info"},
+			expDirective: "error_log stderr info;",
+			expectJSON:   false,
+		},
+		{
+			name:         "error log appends json keyword when ErrorLogFormat is json",
+			logging:      dataplane.Logging{ErrorLevel: "info", ErrorLogFormat: "json"},
+			expDirective: "error_log stderr info json;",
+			expectJSON:   true,
+		},
+	}
+
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			t.Parallel()
+			g := NewWithT(t)
+
+			res := executeMainConfig(dataplane.Configuration{Logging: test.logging}, &policiesfakes.FakeGenerator{})
+			g.Expect(res).To(HaveLen(1))
+			g.Expect(res[0].dest).To(Equal(mainIncludesConfigFile))
+			g.Expect(string(res[0].data)).To(ContainSubstring(test.expDirective))
+			if !test.expectJSON {
+				g.Expect(string(res[0].data)).ToNot(ContainSubstring("error_log stderr info json"))
+			}
+		})
+	}
 }
 
 func TestExecuteMainConfig_Snippets(t *testing.T) {

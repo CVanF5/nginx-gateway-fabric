@@ -8,6 +8,7 @@ import (
 	appsv1 "k8s.io/api/apps/v1"
 	autoscalingv2 "k8s.io/api/autoscaling/v2"
 	corev1 "k8s.io/api/core/v1"
+	policyv1 "k8s.io/api/policy/v1"
 	rbacv1 "k8s.io/api/rbac/v1"
 	apiextv1 "k8s.io/apiextensions-apiserver/pkg/apis/apiextensions/v1"
 	"k8s.io/apimachinery/pkg/api/resource"
@@ -26,6 +27,47 @@ import (
 	"github.com/nginx/nginx-gateway-fabric/v2/internal/framework/controller"
 	"github.com/nginx/nginx-gateway-fabric/v2/internal/framework/helpers"
 )
+
+// graphListenersFromGateway converts raw Gateway spec listeners to graph Listeners for testing.
+func graphListenersFromGateway(gw *gatewayv1.Gateway) []*graph.Listener {
+	listeners := make([]*graph.Listener, 0, len(gw.Spec.Listeners))
+	for _, l := range gw.Spec.Listeners {
+		listeners = append(listeners, &graph.Listener{
+			Name:   string(l.Name),
+			Source: l,
+		})
+	}
+	return listeners
+}
+
+func findDaemonSet(objects []client.Object) *appsv1.DaemonSet {
+	for _, obj := range objects {
+		if ds, ok := obj.(*appsv1.DaemonSet); ok {
+			return ds
+		}
+	}
+	return nil
+}
+
+func findDeployment(objects []client.Object) *appsv1.Deployment {
+	for _, obj := range objects {
+		if dep, ok := obj.(*appsv1.Deployment); ok {
+			return dep
+		}
+	}
+	return nil
+}
+
+func findAgentConfigMap(objects []client.Object) *corev1.ConfigMap {
+	for _, obj := range objects {
+		if cm, ok := obj.(*corev1.ConfigMap); ok {
+			if _, hasAgentKey := cm.Data[configmaps.AgentConfKey]; hasAgentKey {
+				return cm
+			}
+		}
+	}
+	return nil
+}
 
 func TestBuildNginxResourceObjects(t *testing.T) {
 	t.Parallel()
@@ -49,6 +91,7 @@ func TestBuildNginxResourceObjects(t *testing.T) {
 			},
 			AgentTLSSecretName: agentTLSTestSecretName,
 			AgentLabels:        make(map[string]string),
+			GatewayCtlrName:    "nginx-gateway-controller",
 		},
 		baseLabelSelector: metav1.LabelSelector{
 			MatchLabels: map[string]string{
@@ -121,7 +164,9 @@ func TestBuildNginxResourceObjects(t *testing.T) {
 					},
 				},
 			},
-		})
+		},
+		graphListenersFromGateway(gateway),
+	)
 	g.Expect(err).ToNot(HaveOccurred())
 
 	g.Expect(objects).To(HaveLen(6))
@@ -160,6 +205,13 @@ func TestBuildNginxResourceObjects(t *testing.T) {
 	validateLabelsAndAnnotations(cm)
 	g.Expect(cm.Data).To(HaveKey(configmaps.AgentConfKey))
 	g.Expect(cm.Data[configmaps.AgentConfKey]).To(ContainSubstring("command:"))
+	// Verify base agent features (metrics enabled by default)
+	g.Expect(cm.Data[configmaps.AgentConfKey]).To(ContainSubstring("- configuration"))
+	g.Expect(cm.Data[configmaps.AgentConfKey]).To(ContainSubstring("- certificates"))
+	g.Expect(cm.Data[configmaps.AgentConfKey]).To(ContainSubstring("- metrics"))
+	// Should not have WAF or Plus features
+	g.Expect(cm.Data[configmaps.AgentConfKey]).ToNot(ContainSubstring("- logs-nap"))
+	g.Expect(cm.Data[configmaps.AgentConfKey]).ToNot(ContainSubstring("- api-action"))
 
 	svcAcctObj := objects[3]
 	svcAcct, ok := svcAcctObj.(*corev1.ServiceAccount)
@@ -196,7 +248,8 @@ func TestBuildNginxResourceObjects(t *testing.T) {
 			TargetPort: intstr.FromInt(9999),
 		},
 	}))
-	g.Expect(svc.Spec.ExternalIPs).To(Equal([]string{"192.0.0.2"}))
+	g.Expect(svc.Spec.ExternalIPs).To(BeNil())
+	g.Expect(*svc.Spec.LoadBalancerClass).To(Equal("nginx-gateway-controller"))
 
 	depObj := objects[5]
 	dep, ok := depObj.(*appsv1.Deployment)
@@ -239,6 +292,115 @@ func TestBuildNginxResourceObjects(t *testing.T) {
 
 	g.Expect(initContainer.Image).To(Equal("ngf-image"))
 	g.Expect(initContainer.ImagePullPolicy).To(Equal(defaultImagePullPolicy))
+}
+
+// TestBuildNginxResourceObjects_ListenerSetPorts verifies that listeners from ListenerSets
+// are included in the Service and container ports. This is a regression test for a bug where
+// a ListenerSet adding an HTTPS listener on port 443 would not create a LB rule for that port.
+func TestBuildNginxResourceObjects_ListenerSetPorts(t *testing.T) {
+	t.Parallel()
+	g := NewWithT(t)
+
+	agentTLSSecret := &corev1.Secret{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      agentTLSTestSecretName,
+			Namespace: ngfNamespace,
+		},
+		Data: map[string][]byte{secrets.TLSCertKey: []byte("tls")},
+	}
+	fakeClient := createFakeClientWithScheme(agentTLSSecret)
+
+	provisioner := &NginxProvisioner{
+		cfg: Config{
+			GatewayPodConfig: &config.GatewayPodConfig{
+				Namespace: ngfNamespace,
+				Version:   "1.0.0",
+				Image:     "ngf-image",
+			},
+			AgentTLSSecretName: agentTLSTestSecretName,
+			AgentLabels:        make(map[string]string),
+		},
+		baseLabelSelector: metav1.LabelSelector{
+			MatchLabels: map[string]string{
+				"app": "nginx",
+			},
+		},
+		k8sClient: fakeClient,
+	}
+
+	// Gateway only defines port 80
+	gateway := &gatewayv1.Gateway{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      "gw",
+			Namespace: "default",
+		},
+		Spec: gatewayv1.GatewaySpec{
+			Listeners: []gatewayv1.Listener{
+				{
+					Name:     "http",
+					Port:     80,
+					Protocol: gatewayv1.HTTPProtocolType,
+				},
+			},
+		},
+	}
+
+	// The graph has merged listeners from both the Gateway (port 80) and a ListenerSet (port 443)
+	hostname := gatewayv1.Hostname("example.org")
+	allListeners := []*graph.Listener{
+		{
+			Name:   "http",
+			Source: gatewayv1.Listener{Name: "http", Port: 80, Protocol: gatewayv1.HTTPProtocolType},
+		},
+		{
+			Name:   "https",
+			Source: gatewayv1.Listener{Name: "https", Port: 443, Protocol: gatewayv1.HTTPSProtocolType, Hostname: &hostname},
+		},
+	}
+
+	resourceName := "gw-nginx"
+	objects, err := provisioner.buildNginxResourceObjects(
+		resourceName,
+		gateway,
+		&graph.EffectiveNginxProxy{},
+		allListeners,
+	)
+	g.Expect(err).ToNot(HaveOccurred())
+
+	// Find the Service and verify it has both port 80 and port 443
+	var svc *corev1.Service
+	for _, obj := range objects {
+		if s, ok := obj.(*corev1.Service); ok {
+			svc = s
+			break
+		}
+	}
+	g.Expect(svc).ToNot(BeNil(), "Service should be created")
+
+	var hasPort80, hasPort443 bool
+	for _, port := range svc.Spec.Ports {
+		if port.Port == 80 {
+			hasPort80 = true
+		}
+		if port.Port == 443 {
+			hasPort443 = true
+		}
+	}
+	g.Expect(hasPort80).To(BeTrue(), "Service should have port 80 from Gateway listener")
+	g.Expect(hasPort443).To(BeTrue(), "Service should have port 443 from ListenerSet listener")
+
+	// Find the Deployment and verify container ports include 443
+	dep := findDeployment(objects)
+	g.Expect(dep).ToNot(BeNil(), "Deployment should be created")
+
+	var containerHasPort443 bool
+	for _, port := range dep.Spec.Template.Spec.Containers[0].Ports {
+		if port.ContainerPort == 443 {
+			containerHasPort443 = true
+			break
+		}
+	}
+	g.Expect(containerHasPort443).To(BeTrue(), "Container should have port 443 from ListenerSet listener")
 }
 
 func TestBuildNginxResourceObjects_NginxProxyConfig(t *testing.T) {
@@ -333,7 +495,12 @@ func TestBuildNginxResourceObjects_NginxProxyConfig(t *testing.T) {
 		},
 	}
 
-	objects, err := provisioner.buildNginxResourceObjects(resourceName, gateway, nProxyCfg)
+	objects, err := provisioner.buildNginxResourceObjects(
+		resourceName,
+		gateway,
+		nProxyCfg,
+		graphListenersFromGateway(gateway),
+	)
 	g.Expect(err).ToNot(HaveOccurred())
 
 	g.Expect(objects).To(HaveLen(7))
@@ -349,12 +516,16 @@ func TestBuildNginxResourceObjects_NginxProxyConfig(t *testing.T) {
 	g.Expect(ok).To(BeTrue())
 	g.Expect(cm.Data[configmaps.AgentConfKey]).To(ContainSubstring("level: debug"))
 	g.Expect(cm.Data[configmaps.AgentConfKey]).To(ContainSubstring("port: 8080"))
+	// Verify agent features - should have base + metrics
+	g.Expect(cm.Data[configmaps.AgentConfKey]).To(ContainSubstring("- configuration"))
+	g.Expect(cm.Data[configmaps.AgentConfKey]).To(ContainSubstring("- certificates"))
+	g.Expect(cm.Data[configmaps.AgentConfKey]).To(ContainSubstring("- metrics"))
 
 	svcObj := objects[4]
 	svc, ok := svcObj.(*corev1.Service)
 	g.Expect(ok).To(BeTrue())
 	g.Expect(svc.Spec.Type).To(Equal(corev1.ServiceTypeNodePort))
-	g.Expect(svc.Spec.ExternalTrafficPolicy).To(Equal(corev1.ServiceExternalTrafficPolicyTypeCluster))
+	g.Expect(svc.Spec.ExternalTrafficPolicy).To(Equal(corev1.ServiceExternalTrafficPolicyCluster))
 	g.Expect(svc.Spec.LoadBalancerIP).To(Equal("1.2.3.4"))
 	g.Expect(*svc.Spec.LoadBalancerClass).To(Equal("myLoadBalancerClass"))
 	g.Expect(svc.Spec.LoadBalancerSourceRanges).To(Equal([]string{"5.6.7.8"}))
@@ -501,7 +672,12 @@ func TestBuildNginxResourceObjects_ExposeHealthcheck(t *testing.T) {
 				k8sClient: fakeClient,
 			}
 
-			objects, err := provisioner.buildNginxResourceObjects(resourceName, gateway, test.nProxyCfg)
+			objects, err := provisioner.buildNginxResourceObjects(
+				resourceName,
+				gateway,
+				test.nProxyCfg,
+				graphListenersFromGateway(gateway),
+			)
 			g.Expect(err).ToNot(HaveOccurred())
 
 			// Find the service object
@@ -670,17 +846,16 @@ func TestBuildNginxResourceObjects_DeploymentReplicasFromHPA(t *testing.T) {
 				},
 			}
 
-			objects, err := provisioner.buildNginxResourceObjects(resourceName, gateway, nProxyCfg)
+			objects, err := provisioner.buildNginxResourceObjects(
+				resourceName,
+				gateway,
+				nProxyCfg,
+				graphListenersFromGateway(gateway),
+			)
 			g.Expect(err).ToNot(HaveOccurred())
 
 			// Find the deployment object
-			var deployment *appsv1.Deployment
-			for _, obj := range objects {
-				if d, ok := obj.(*appsv1.Deployment); ok {
-					deployment = d
-					break
-				}
-			}
+			deployment := findDeployment(objects)
 			g.Expect(deployment).ToNot(BeNil())
 
 			if tc.expectedNil {
@@ -772,7 +947,12 @@ func TestBuildNginxResourceObjects_Plus(t *testing.T) {
 	}
 
 	resourceName := "gw-nginx"
-	objects, err := provisioner.buildNginxResourceObjects(resourceName, gateway, &graph.EffectiveNginxProxy{})
+	objects, err := provisioner.buildNginxResourceObjects(
+		resourceName,
+		gateway,
+		&graph.EffectiveNginxProxy{},
+		graphListenersFromGateway(gateway),
+	)
 	g.Expect(err).ToNot(HaveOccurred())
 
 	g.Expect(objects).To(HaveLen(9))
@@ -829,7 +1009,10 @@ func TestBuildNginxResourceObjects_Plus(t *testing.T) {
 	cm, ok = cmObj.(*corev1.ConfigMap)
 	g.Expect(ok).To(BeTrue())
 	g.Expect(cm.Data).To(HaveKey(configmaps.AgentConfKey))
-	g.Expect(cm.Data[configmaps.AgentConfKey]).To(ContainSubstring("api-action"))
+	// Verify agent features - should have base + api-action (Plus)
+	g.Expect(cm.Data[configmaps.AgentConfKey]).To(ContainSubstring("- configuration"))
+	g.Expect(cm.Data[configmaps.AgentConfKey]).To(ContainSubstring("- certificates"))
+	g.Expect(cm.Data[configmaps.AgentConfKey]).To(ContainSubstring("- api-action"))
 
 	depObj := objects[8]
 	dep, ok := depObj.(*appsv1.Deployment)
@@ -919,7 +1102,12 @@ func TestBuildNginxResourceObjects_DockerSecrets(t *testing.T) {
 	}
 
 	resourceName := "gw-nginx"
-	objects, err := provisioner.buildNginxResourceObjects(resourceName, gateway, &graph.EffectiveNginxProxy{})
+	objects, err := provisioner.buildNginxResourceObjects(
+		resourceName,
+		gateway,
+		&graph.EffectiveNginxProxy{},
+		graphListenersFromGateway(gateway),
+	)
 	g.Expect(err).ToNot(HaveOccurred())
 
 	g.Expect(objects).To(HaveLen(9))
@@ -985,10 +1173,21 @@ func TestBuildNginxResourceObjects_DaemonSet(t *testing.T) {
 		},
 		Data: map[string][]byte{secrets.TLSCertKey: []byte("tls")},
 	}
-	fakeClient := createFakeClientWithScheme(agentTLSSecret)
+	jwtSecret := &corev1.Secret{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      jwtTestSecretName,
+			Namespace: ngfNamespace,
+		},
+		Data: map[string][]byte{secrets.LicenseJWTKey: []byte("jwt")},
+	}
+	fakeClient := createFakeClientWithScheme(agentTLSSecret, jwtSecret)
 
 	provisioner := &NginxProvisioner{
 		cfg: Config{
+			Plus: true,
+			PlusUsageConfig: &config.UsageReportConfig{
+				SecretName: jwtTestSecretName,
+			},
 			GatewayPodConfig: &config.GatewayPodConfig{
 				Namespace: ngfNamespace,
 			},
@@ -1014,6 +1213,7 @@ func TestBuildNginxResourceObjects_DaemonSet(t *testing.T) {
 	}
 
 	nProxyCfg := &graph.EffectiveNginxProxy{
+		WAF: &ngfAPIv1alpha2.WAFSpec{Enable: helpers.GetPointer(true)},
 		Kubernetes: &ngfAPIv1alpha2.KubernetesSpec{
 			DaemonSet: &ngfAPIv1alpha2.DaemonSetSpec{
 				Pod: ngfAPIv1alpha2.PodSpec{
@@ -1036,10 +1236,16 @@ func TestBuildNginxResourceObjects_DaemonSet(t *testing.T) {
 	}
 
 	resourceName := "gw-nginx"
-	objects, err := provisioner.buildNginxResourceObjects(resourceName, gateway, nProxyCfg)
+	objects, err := provisioner.buildNginxResourceObjects(
+		resourceName,
+		gateway,
+		nProxyCfg,
+		graphListenersFromGateway(gateway),
+	)
 	g.Expect(err).ToNot(HaveOccurred())
 
-	g.Expect(objects).To(HaveLen(6))
+	// 2 secrets (agentTLS, JWT) + 2 configmaps (includes, agent) + serviceaccount + service + daemonset
+	g.Expect(objects).To(HaveLen(7))
 
 	expLabels := map[string]string{
 		"app":                                    "nginx",
@@ -1047,9 +1253,16 @@ func TestBuildNginxResourceObjects_DaemonSet(t *testing.T) {
 		"app.kubernetes.io/name":                 "gw-nginx",
 	}
 
-	dsObj := objects[5]
-	ds, ok := dsObj.(*appsv1.DaemonSet)
-	g.Expect(ok).To(BeTrue())
+	// Verify agent ConfigMap contains WAF logs-nap feature
+	agentCM := findAgentConfigMap(objects)
+	g.Expect(agentCM).ToNot(BeNil())
+	// Verify agent features - should have base + logs-nap (WAF)
+	g.Expect(agentCM.Data[configmaps.AgentConfKey]).To(ContainSubstring("- configuration"))
+	g.Expect(agentCM.Data[configmaps.AgentConfKey]).To(ContainSubstring("- certificates"))
+	g.Expect(agentCM.Data[configmaps.AgentConfKey]).To(ContainSubstring("- logs-nap"))
+
+	ds := findDaemonSet(objects)
+	g.Expect(ds).ToNot(BeNil())
 	g.Expect(ds.GetLabels()).To(Equal(expLabels))
 
 	template := ds.Spec.Template
@@ -1061,6 +1274,11 @@ func TestBuildNginxResourceObjects_DaemonSet(t *testing.T) {
 	g.Expect(container.ImagePullPolicy).To(Equal(corev1.PullAlways))
 	g.Expect(container.Resources.Limits).To(HaveKey(corev1.ResourceCPU))
 	g.Expect(container.Resources.Limits[corev1.ResourceCPU].Format).To(Equal(resource.Format("100m")))
+
+	// verify WAF container is present - we can assume the rest of the WAF configuration is correct
+	// as it is tested elsewhere
+	wafContainer := template.Spec.Containers[1]
+	g.Expect(wafContainer.Image).To(ContainSubstring("private-registry.nginx.com/nap/waf-enforcer"))
 }
 
 func TestBuildNginxResourceObjects_OpenShift(t *testing.T) {
@@ -1104,7 +1322,12 @@ func TestBuildNginxResourceObjects_OpenShift(t *testing.T) {
 	}
 
 	resourceName := "gw-nginx"
-	objects, err := provisioner.buildNginxResourceObjects(resourceName, gateway, &graph.EffectiveNginxProxy{})
+	objects, err := provisioner.buildNginxResourceObjects(
+		resourceName,
+		gateway,
+		&graph.EffectiveNginxProxy{},
+		graphListenersFromGateway(gateway),
+	)
 	g.Expect(err).ToNot(HaveOccurred())
 
 	g.Expect(objects).To(HaveLen(8))
@@ -1181,7 +1404,12 @@ func TestBuildNginxResourceObjects_DataplaneKeySecret(t *testing.T) {
 	}
 
 	resourceName := "gw-nginx"
-	objects, err := provisioner.buildNginxResourceObjects(resourceName, gateway, &graph.EffectiveNginxProxy{})
+	objects, err := provisioner.buildNginxResourceObjects(
+		resourceName,
+		gateway,
+		&graph.EffectiveNginxProxy{},
+		graphListenersFromGateway(gateway),
+	)
 	g.Expect(err).ToNot(HaveOccurred())
 	g.Expect(objects).To(HaveLen(7)) // 2 secrets, 2 configmaps, serviceaccount, service, deployment
 
@@ -1251,7 +1479,7 @@ func TestBuildResourcesForInvalidGatewayCleanup(t *testing.T) {
 
 	objects := provisioner.buildResourcesForInvalidGatewayCleanup(deploymentNSName)
 
-	g.Expect(objects).To(HaveLen(8))
+	g.Expect(objects).To(HaveLen(9))
 
 	validateMeta := func(obj client.Object, name string) {
 		g.Expect(obj.GetName()).To(Equal(name))
@@ -1278,17 +1506,22 @@ func TestBuildResourcesForInvalidGatewayCleanup(t *testing.T) {
 	g.Expect(ok).To(BeTrue())
 	validateMeta(hpa, deploymentNSName.Name)
 
-	svcAcctObj := objects[4]
+	pdbObj := objects[4]
+	pdb, ok := pdbObj.(*policyv1.PodDisruptionBudget)
+	g.Expect(ok).To(BeTrue())
+	validateMeta(pdb, deploymentNSName.Name)
+
+	svcAcctObj := objects[5]
 	svcAcct, ok := svcAcctObj.(*corev1.ServiceAccount)
 	g.Expect(ok).To(BeTrue())
 	validateMeta(svcAcct, deploymentNSName.Name)
 
-	cmObj := objects[5]
+	cmObj := objects[6]
 	cm, ok := cmObj.(*corev1.ConfigMap)
 	g.Expect(ok).To(BeTrue())
 	validateMeta(cm, controller.CreateNginxResourceName(deploymentNSName.Name, nginxIncludesConfigMapNameSuffix))
 
-	cmObj = objects[6]
+	cmObj = objects[7]
 	cm, ok = cmObj.(*corev1.ConfigMap)
 	g.Expect(ok).To(BeTrue())
 	validateMeta(cm, controller.CreateNginxResourceName(deploymentNSName.Name, nginxAgentConfigMapNameSuffix))
@@ -1318,7 +1551,7 @@ func TestBuildResourcesForInvalidGatewayCleanup_Plus(t *testing.T) {
 
 	objects := provisioner.buildResourcesForInvalidGatewayCleanup(deploymentNSName)
 
-	g.Expect(objects).To(HaveLen(12))
+	g.Expect(objects).To(HaveLen(13))
 
 	validateMeta := func(obj client.Object, name string) {
 		g.Expect(obj.GetName()).To(Equal(name))
@@ -1345,22 +1578,27 @@ func TestBuildResourcesForInvalidGatewayCleanup_Plus(t *testing.T) {
 	g.Expect(ok).To(BeTrue())
 	validateMeta(hpa, deploymentNSName.Name)
 
-	svcAcctObj := objects[4]
+	pdbObj := objects[4]
+	pdb, ok := pdbObj.(*policyv1.PodDisruptionBudget)
+	g.Expect(ok).To(BeTrue())
+	validateMeta(pdb, deploymentNSName.Name)
+
+	svcAcctObj := objects[5]
 	svcAcct, ok := svcAcctObj.(*corev1.ServiceAccount)
 	g.Expect(ok).To(BeTrue())
 	validateMeta(svcAcct, deploymentNSName.Name)
 
-	cmObj := objects[5]
+	cmObj := objects[6]
 	cm, ok := cmObj.(*corev1.ConfigMap)
 	g.Expect(ok).To(BeTrue())
 	validateMeta(cm, controller.CreateNginxResourceName(deploymentNSName.Name, nginxIncludesConfigMapNameSuffix))
 
-	cmObj = objects[6]
+	cmObj = objects[7]
 	cm, ok = cmObj.(*corev1.ConfigMap)
 	g.Expect(ok).To(BeTrue())
 	validateMeta(cm, controller.CreateNginxResourceName(deploymentNSName.Name, nginxAgentConfigMapNameSuffix))
 
-	secretObj := objects[7]
+	secretObj := objects[8]
 	secret, ok := secretObj.(*corev1.Secret)
 	g.Expect(ok).To(BeTrue())
 	validateMeta(secret, controller.CreateNginxResourceName(
@@ -1368,7 +1606,7 @@ func TestBuildResourcesForInvalidGatewayCleanup_Plus(t *testing.T) {
 		provisioner.cfg.AgentTLSSecretName,
 	))
 
-	secretObj = objects[8]
+	secretObj = objects[9]
 	secret, ok = secretObj.(*corev1.Secret)
 	g.Expect(ok).To(BeTrue())
 	validateMeta(secret, controller.CreateNginxResourceName(
@@ -1376,7 +1614,7 @@ func TestBuildResourcesForInvalidGatewayCleanup_Plus(t *testing.T) {
 		provisioner.cfg.NginxDockerSecretNames[0],
 	))
 
-	secretObj = objects[9]
+	secretObj = objects[10]
 	secret, ok = secretObj.(*corev1.Secret)
 	g.Expect(ok).To(BeTrue())
 	validateMeta(secret, controller.CreateNginxResourceName(
@@ -1384,7 +1622,7 @@ func TestBuildResourcesForInvalidGatewayCleanup_Plus(t *testing.T) {
 		provisioner.cfg.PlusUsageConfig.CASecretName,
 	))
 
-	secretObj = objects[10]
+	secretObj = objects[11]
 	secret, ok = secretObj.(*corev1.Secret)
 	g.Expect(ok).To(BeTrue())
 	validateMeta(secret, controller.CreateNginxResourceName(
@@ -1406,7 +1644,7 @@ func TestBuildResourcesForInvalidGatewayCleanup_OpenShift(t *testing.T) {
 
 	objects := provisioner.buildResourcesForInvalidGatewayCleanup(deploymentNSName)
 
-	g.Expect(objects).To(HaveLen(10))
+	g.Expect(objects).To(HaveLen(11))
 
 	validateMeta := func(obj client.Object, name string) {
 		g.Expect(obj.GetName()).To(Equal(name))
@@ -1418,12 +1656,17 @@ func TestBuildResourcesForInvalidGatewayCleanup_OpenShift(t *testing.T) {
 	g.Expect(ok).To(BeTrue())
 	validateMeta(hpa, deploymentNSName.Name)
 
-	roleObj := objects[4]
+	pdbObj := objects[4]
+	pdb, ok := pdbObj.(*policyv1.PodDisruptionBudget)
+	g.Expect(ok).To(BeTrue())
+	validateMeta(pdb, deploymentNSName.Name)
+
+	roleObj := objects[5]
 	role, ok := roleObj.(*rbacv1.Role)
 	g.Expect(ok).To(BeTrue())
 	validateMeta(role, deploymentNSName.Name)
 
-	roleBindingObj := objects[5]
+	roleBindingObj := objects[6]
 	roleBinding, ok := roleBindingObj.(*rbacv1.RoleBinding)
 	g.Expect(ok).To(BeTrue())
 	validateMeta(roleBinding, deploymentNSName.Name)
@@ -1452,8 +1695,8 @@ func TestBuildResourcesForInvalidGatewayCleanup_DataplaneKeySecret(t *testing.T)
 	objects := provisioner.buildResourcesForInvalidGatewayCleanup(deploymentNSName)
 
 	// Should include the dataplane key secret in the objects list
-	// Default: deployment, daemonset, service, hpa, serviceaccount, 2 configmaps, agentTLSSecret, dataplaneKeySecret
-	g.Expect(objects).To(HaveLen(9))
+	// Default: deployment, daemonset, service, hpa, pdb, serviceaccount, 2 configmaps, agentTLSSecret, dataplaneKeySecret
+	g.Expect(objects).To(HaveLen(10))
 
 	validateMeta := func(obj client.Object, name string) {
 		g.Expect(obj.GetName()).To(Equal(name))
@@ -1471,6 +1714,95 @@ func TestBuildResourcesForInvalidGatewayCleanup_DataplaneKeySecret(t *testing.T)
 		}
 	}
 	g.Expect(found).To(BeTrue())
+}
+
+func TestBuildNginxDeploymentPDB(t *testing.T) {
+	t.Parallel()
+
+	provisioner := &NginxProvisioner{}
+
+	selectorLabels := map[string]string{
+		"app":     "nginx",
+		"gateway": "gw",
+	}
+	objectMeta := metav1.ObjectMeta{
+		Name:      "gw-nginx",
+		Namespace: "default",
+		Labels:    map[string]string{"app": "nginx"},
+	}
+
+	tests := []struct {
+		pdbSpec                        *ngfAPIv1alpha2.PodDisruptionBudgetSpec
+		wantMinAvail                   *intstr.IntOrString
+		wantMaxUnavail                 *intstr.IntOrString
+		wantUnhealthyPodEvictionPolicy *policyv1.UnhealthyPodEvictionPolicyType
+		name                           string
+	}{
+		{
+			name: "minAvailable set as absolute number",
+			pdbSpec: &ngfAPIv1alpha2.PodDisruptionBudgetSpec{
+				MinAvailable: func() *intstr.IntOrString { v := intstr.FromInt32(1); return &v }(),
+			},
+			wantMinAvail: func() *intstr.IntOrString { v := intstr.FromInt32(1); return &v }(),
+		},
+		{
+			name: "minAvailable set as percentage",
+			pdbSpec: &ngfAPIv1alpha2.PodDisruptionBudgetSpec{
+				MinAvailable: func() *intstr.IntOrString { v := intstr.FromString("50%"); return &v }(),
+			},
+			wantMinAvail: func() *intstr.IntOrString { v := intstr.FromString("50%"); return &v }(),
+		},
+		{
+			name: "maxUnavailable set as absolute number",
+			pdbSpec: &ngfAPIv1alpha2.PodDisruptionBudgetSpec{
+				MaxUnavailable: func() *intstr.IntOrString { v := intstr.FromInt32(1); return &v }(),
+			},
+			wantMaxUnavail: func() *intstr.IntOrString { v := intstr.FromInt32(1); return &v }(),
+		},
+		{
+			name: "maxUnavailable set as percentage",
+			pdbSpec: &ngfAPIv1alpha2.PodDisruptionBudgetSpec{
+				MaxUnavailable: func() *intstr.IntOrString { v := intstr.FromString("20%"); return &v }(),
+			},
+			wantMaxUnavail: func() *intstr.IntOrString { v := intstr.FromString("20%"); return &v }(),
+		},
+		{
+			name: "unhealthyPodEvictionPolicy set to AlwaysAllow",
+			pdbSpec: &ngfAPIv1alpha2.PodDisruptionBudgetSpec{
+				MinAvailable:               func() *intstr.IntOrString { v := intstr.FromInt32(1); return &v }(),
+				UnhealthyPodEvictionPolicy: helpers.GetPointer(policyv1.AlwaysAllow),
+			},
+			wantMinAvail:                   func() *intstr.IntOrString { v := intstr.FromInt32(1); return &v }(),
+			wantUnhealthyPodEvictionPolicy: helpers.GetPointer(policyv1.AlwaysAllow),
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+			g := NewWithT(t)
+
+			nProxyCfg := &graph.EffectiveNginxProxy{
+				Kubernetes: &ngfAPIv1alpha2.KubernetesSpec{
+					Deployment: &ngfAPIv1alpha2.DeploymentSpec{
+						PodDisruptionBudget: tt.pdbSpec,
+					},
+				},
+			}
+
+			obj := provisioner.buildPDB(objectMeta, nProxyCfg, selectorLabels)
+			pdb, ok := obj.(*policyv1.PodDisruptionBudget)
+			g.Expect(ok).To(BeTrue())
+
+			g.Expect(pdb.Name).To(Equal(objectMeta.Name))
+			g.Expect(pdb.Namespace).To(Equal(objectMeta.Namespace))
+			g.Expect(pdb.Spec.Selector).ToNot(BeNil())
+			g.Expect(pdb.Spec.Selector.MatchLabels).To(Equal(selectorLabels))
+			g.Expect(pdb.Spec.MinAvailable).To(Equal(tt.wantMinAvail))
+			g.Expect(pdb.Spec.MaxUnavailable).To(Equal(tt.wantMaxUnavail))
+			g.Expect(pdb.Spec.UnhealthyPodEvictionPolicy).To(Equal(tt.wantUnhealthyPodEvictionPolicy))
+		})
+	}
 }
 
 func TestSetIPFamily(t *testing.T) {
@@ -1605,6 +1937,7 @@ func TestBuildNginxConfigMaps_AgentFields(t *testing.T) {
 				EndpointPort:           443,
 				EndpointTLSSkipVerify:  false,
 			},
+			ServerTLSDomain: "svc",
 		},
 	}
 	objectMeta := metav1.ObjectMeta{Name: "test", Namespace: "default"}
@@ -1640,6 +1973,49 @@ func TestBuildNginxConfigMaps_AgentFields(t *testing.T) {
 	g.Expect(data).To(ContainSubstring("host: console.example.com"))
 	g.Expect(data).To(ContainSubstring("port: 443"))
 	g.Expect(data).To(ContainSubstring("skip_verify: false"))
+	g.Expect(data).To(ContainSubstring("host: test-service.default.svc"))
+	g.Expect(data).To(ContainSubstring("server_name: test-service.default.svc"))
+	// Verify base agent features are present (metrics enabled by default)
+	g.Expect(data).To(ContainSubstring("- configuration"))
+	g.Expect(data).To(ContainSubstring("- certificates"))
+	g.Expect(data).To(ContainSubstring("- metrics"))
+	// Should not have WAF or Plus features
+	g.Expect(data).ToNot(ContainSubstring("- logs-nap"))
+	g.Expect(data).ToNot(ContainSubstring("- api-action"))
+}
+
+func TestBuildNginxConfigMaps_AgentConfigUsesCustomServerTLSDomain(t *testing.T) {
+	t.Parallel()
+	g := NewWithT(t)
+
+	fakeClient := createFakeClientWithScheme()
+	provisioner := &NginxProvisioner{
+		k8sClient: fakeClient,
+		cfg: Config{
+			GatewayPodConfig: &config.GatewayPodConfig{
+				Namespace:   "default",
+				ServiceName: "test-service",
+			},
+			AgentLabels:     make(map[string]string),
+			ServerTLSDomain: "internal.mycompany.com",
+		},
+	}
+	objectMeta := metav1.ObjectMeta{Name: "test", Namespace: "default"}
+
+	gateway := &gatewayv1.Gateway{
+		ObjectMeta: metav1.ObjectMeta{Name: "gw", Namespace: "default"},
+	}
+
+	names := provisioner.buildResourceNames("gw-nginx")
+	configMaps, errs := provisioner.buildNginxConfigMaps(objectMeta, &graph.EffectiveNginxProxy{}, names, gateway)
+	g.Expect(errs).To(BeNil())
+
+	agentCM, ok := configMaps[1].(*corev1.ConfigMap)
+	g.Expect(ok).To(BeTrue())
+	data := agentCM.Data[configmaps.AgentConfKey]
+
+	g.Expect(data).To(ContainSubstring("host: test-service.default.internal.mycompany.com"))
+	g.Expect(data).To(ContainSubstring("server_name: test-service.default.internal.mycompany.com"))
 }
 
 func TestBuildReadinessProbe(t *testing.T) {
@@ -1823,7 +2199,12 @@ func TestBuildNginxResourceObjects_Patches(t *testing.T) {
 		},
 		Spec: gatewayv1.GatewaySpec{
 			Listeners: []gatewayv1.Listener{
-				{Port: 80},
+				{
+					Port: 80,
+				},
+				{
+					Port: 8888,
+				},
 			},
 		},
 	}
@@ -1866,7 +2247,12 @@ func TestBuildNginxResourceObjects_Patches(t *testing.T) {
 		},
 	}
 
-	objects, err := provisioner.buildNginxResourceObjects("gw-nginx", gateway, nProxyCfg)
+	objects, err := provisioner.buildNginxResourceObjects(
+		"gw-nginx",
+		gateway,
+		nProxyCfg,
+		graphListenersFromGateway(gateway),
+	)
 	g.Expect(err).ToNot(HaveOccurred())
 	g.Expect(objects).To(HaveLen(6))
 
@@ -1884,13 +2270,7 @@ func TestBuildNginxResourceObjects_Patches(t *testing.T) {
 	g.Expect(svc.Labels).To(HaveKeyWithValue("svc-json", "true"))
 
 	// Find and validate deployment
-	var dep *appsv1.Deployment
-	for _, obj := range objects {
-		if d, ok := obj.(*appsv1.Deployment); ok {
-			dep = d
-			break
-		}
-	}
+	dep := findDeployment(objects)
 	g.Expect(dep).ToNot(BeNil())
 	g.Expect(dep.Labels).To(HaveKeyWithValue("dep-patched", "true"))
 	g.Expect(dep.Spec.Replicas).To(Equal(helpers.GetPointer(int32(3))))
@@ -1917,7 +2297,12 @@ func TestBuildNginxResourceObjects_Patches(t *testing.T) {
 		},
 	}
 
-	objects, err = provisioner.buildNginxResourceObjects("gw-nginx", gateway, nProxyCfg)
+	objects, err = provisioner.buildNginxResourceObjects(
+		"gw-nginx",
+		gateway,
+		nProxyCfg,
+		graphListenersFromGateway(gateway),
+	)
 	g.Expect(err).ToNot(HaveOccurred())
 	g.Expect(objects).To(HaveLen(6))
 
@@ -1948,7 +2333,12 @@ func TestBuildNginxResourceObjects_Patches(t *testing.T) {
 		},
 	}
 
-	objects, err = provisioner.buildNginxResourceObjects("gw-nginx", gateway, nProxyCfg)
+	objects, err = provisioner.buildNginxResourceObjects(
+		"gw-nginx",
+		gateway,
+		nProxyCfg,
+		graphListenersFromGateway(gateway),
+	)
 	g.Expect(err).ToNot(HaveOccurred())
 	g.Expect(objects).To(HaveLen(6))
 
@@ -1989,7 +2379,12 @@ func TestBuildNginxResourceObjects_Patches(t *testing.T) {
 		},
 	}
 
-	objects, err = provisioner.buildNginxResourceObjects("gw-nginx", gateway, nProxyCfg)
+	objects, err = provisioner.buildNginxResourceObjects(
+		"gw-nginx",
+		gateway,
+		nProxyCfg,
+		graphListenersFromGateway(gateway),
+	)
 	g.Expect(err).To(HaveOccurred())
 	g.Expect(err.Error()).To(ContainSubstring("failed to apply service patches"))
 	g.Expect(err.Error()).To(ContainSubstring("failed to apply deployment patches"))
@@ -2011,7 +2406,12 @@ func TestBuildNginxResourceObjects_Patches(t *testing.T) {
 		},
 	}
 
-	objects, err = provisioner.buildNginxResourceObjects("gw-nginx", gateway, nProxyCfg)
+	objects, err = provisioner.buildNginxResourceObjects(
+		"gw-nginx",
+		gateway,
+		nProxyCfg,
+		graphListenersFromGateway(gateway),
+	)
 	g.Expect(err).To(HaveOccurred())
 	g.Expect(err.Error()).To(ContainSubstring("unsupported patch type"))
 	g.Expect(objects).To(HaveLen(6))
@@ -2036,7 +2436,12 @@ func TestBuildNginxResourceObjects_Patches(t *testing.T) {
 		},
 	}
 
-	objects, err = provisioner.buildNginxResourceObjects("gw-nginx", gateway, nProxyCfg)
+	objects, err = provisioner.buildNginxResourceObjects(
+		"gw-nginx",
+		gateway,
+		nProxyCfg,
+		graphListenersFromGateway(gateway),
+	)
 	g.Expect(err).ToNot(HaveOccurred())
 	g.Expect(objects).To(HaveLen(6))
 
@@ -2076,7 +2481,12 @@ func TestBuildNginxResourceObjects_Patches(t *testing.T) {
 		},
 	}
 
-	objects, err = provisioner.buildNginxResourceObjects("gw-nginx", gateway, nProxyCfg)
+	objects, err = provisioner.buildNginxResourceObjects(
+		"gw-nginx",
+		gateway,
+		nProxyCfg,
+		graphListenersFromGateway(gateway),
+	)
 	g.Expect(err).ToNot(HaveOccurred())
 	g.Expect(objects).To(HaveLen(6))
 
@@ -2093,13 +2503,7 @@ func TestBuildNginxResourceObjects_Patches(t *testing.T) {
 	g.Expect(svc.Labels).ToNot(HaveKey("deployment-only"))
 
 	// Find and validate deployment - should only have deployment-specific labels
-	dep = nil
-	for _, obj := range objects {
-		if d, ok := obj.(*appsv1.Deployment); ok {
-			dep = d
-			break
-		}
-	}
+	dep = findDeployment(objects)
 	g.Expect(dep).ToNot(BeNil())
 	g.Expect(dep.Labels).To(HaveKeyWithValue("deployment-only", "true"))
 	g.Expect(dep.Labels).ToNot(HaveKey("service-only"))
@@ -2162,17 +2566,16 @@ func TestBuildNginxResourceObjects_InferenceExtension(t *testing.T) {
 			},
 		},
 	}
-	objects, err := provisioner.buildNginxResourceObjects("gw-nginx", gateway, npCfg)
+	objects, err := provisioner.buildNginxResourceObjects(
+		"gw-nginx",
+		gateway,
+		npCfg,
+		graphListenersFromGateway(gateway),
+	)
 	g.Expect(err).ToNot(HaveOccurred())
 
 	// Find the deployment object
-	var deployment *appsv1.Deployment
-	for _, obj := range objects {
-		if d, ok := obj.(*appsv1.Deployment); ok {
-			deployment = d
-			break
-		}
-	}
+	deployment := findDeployment(objects)
 
 	expectedCommands := []string{
 		"/usr/bin/gateway",
@@ -2293,7 +2696,12 @@ func TestOwnerReferencesAreSet(t *testing.T) {
 	resourceName := controller.CreateNginxResourceName(gateway.Name, "nginx")
 
 	// Build resources
-	objects, err := provisioner.buildNginxResourceObjects(resourceName, gateway, nil)
+	objects, err := provisioner.buildNginxResourceObjects(
+		resourceName,
+		gateway,
+		nil,
+		graphListenersFromGateway(gateway),
+	)
 	g.Expect(err).ToNot(HaveOccurred())
 	g.Expect(objects).ToNot(BeEmpty())
 
@@ -2311,37 +2719,81 @@ func TestOwnerReferencesAreSet(t *testing.T) {
 	}
 }
 
-func TestBuildNginxResourceObjects_ClusterIPWithExternalIPs(t *testing.T) {
+func TestBuildNginxResourceObjects_LoadBalancerClass(t *testing.T) {
 	t.Parallel()
 
+	const ctlrName = "gateway.nginx.org/test-controller"
+
+	makeProvisioner := func(gatewayCtlrName string) *NginxProvisioner {
+		// Create a fresh secret per call so parallel subtests don't share a mutable object.
+		// The fake client builder writes ResourceVersion on the objects passed to it, which
+		// causes a data race when the same object pointer is used concurrently.
+		agentTLSSecret := &corev1.Secret{
+			ObjectMeta: metav1.ObjectMeta{
+				Name:      agentTLSTestSecretName,
+				Namespace: ngfNamespace,
+			},
+			Data: map[string][]byte{secrets.TLSCertKey: []byte("tls")},
+		}
+		return &NginxProvisioner{
+			cfg: Config{
+				GatewayPodConfig: &config.GatewayPodConfig{
+					Namespace: ngfNamespace,
+					Version:   "1.0.0",
+				},
+				AgentTLSSecretName: agentTLSTestSecretName,
+				AgentLabels:        make(map[string]string),
+				GatewayCtlrName:    gatewayCtlrName,
+			},
+			baseLabelSelector: metav1.LabelSelector{
+				MatchLabels: map[string]string{"app": "nginx"},
+			},
+			k8sClient: createFakeClientWithScheme(agentTLSSecret),
+		}
+	}
+
+	ipAddresses := []gatewayv1.GatewaySpecAddress{
+		{Type: helpers.GetPointer(gatewayv1.IPAddressType), Value: "10.0.0.1"},
+	}
+
 	tests := []struct {
-		nProxyCfg                     *graph.EffectiveNginxProxy
-		name                          string
-		expectedExternalTrafficPolicy corev1.ServiceExternalTrafficPolicy
-		gatewayAddresses              []gatewayv1.GatewaySpecAddress
-		expectedExternalIPs           []string
+		nProxyCfg        *graph.EffectiveNginxProxy
+		expectedLBClass  *string
+		name             string
+		gatewayCtlrName  string
+		gatewayAddresses []gatewayv1.GatewaySpecAddress
 	}{
 		{
-			name: "ClusterIP service with an IP-type Gateway address sets externalTrafficPolicy to Local",
-			gatewayAddresses: []gatewayv1.GatewaySpecAddress{
-				{
-					Type:  helpers.GetPointer(gatewayv1.IPAddressType),
-					Value: "10.0.0.1",
-				},
-			},
+			name:             "LB service + IP addresses + no user LBClass + GatewayCtlrName set → sets LoadBalancerClass",
+			gatewayCtlrName:  ctlrName,
+			gatewayAddresses: ipAddresses,
+			nProxyCfg:        nil,
+			expectedLBClass:  helpers.GetPointer(ctlrName),
+		},
+		{
+			name:             "LB service + IP addresses + user LBClass in nProxyCfg → sets LoadBalancerClass",
+			gatewayCtlrName:  ctlrName,
+			gatewayAddresses: ipAddresses,
 			nProxyCfg: &graph.EffectiveNginxProxy{
 				Kubernetes: &ngfAPIv1alpha2.KubernetesSpec{
 					Service: &ngfAPIv1alpha2.ServiceSpec{
-						ServiceType:           helpers.GetPointer(ngfAPIv1alpha2.ServiceTypeClusterIP),
-						ExternalTrafficPolicy: helpers.GetPointer(ngfAPIv1alpha2.ExternalTrafficPolicyLocal),
+						LoadBalancerClass: helpers.GetPointer("custom-lb-class"),
 					},
 				},
 			},
-			expectedExternalIPs:           []string{"10.0.0.1"},
-			expectedExternalTrafficPolicy: corev1.ServiceExternalTrafficPolicyLocal,
+			expectedLBClass: helpers.GetPointer(string(ctlrName)),
 		},
 		{
-			name: "ClusterIP service with no Gateway addresses leaves externalTrafficPolicy unset",
+			name:             "LB service + no IP addresses → LoadBalancerClass nil",
+			gatewayCtlrName:  ctlrName,
+			gatewayAddresses: nil,
+			nProxyCfg:        nil,
+			expectedLBClass:  nil,
+		},
+		{
+			name:             "ClusterIP service + IP addresses → LoadBalancerClass nil",
+			gatewayCtlrName:  ctlrName,
+			gatewayAddresses: ipAddresses,
 			nProxyCfg: &graph.EffectiveNginxProxy{
 				Kubernetes: &ngfAPIv1alpha2.KubernetesSpec{
 					Service: &ngfAPIv1alpha2.ServiceSpec{
@@ -2349,8 +2801,7 @@ func TestBuildNginxResourceObjects_ClusterIPWithExternalIPs(t *testing.T) {
 					},
 				},
 			},
-			expectedExternalIPs:           nil,
-			expectedExternalTrafficPolicy: "",
+			expectedLBClass: nil,
 		},
 	}
 
@@ -2359,29 +2810,7 @@ func TestBuildNginxResourceObjects_ClusterIPWithExternalIPs(t *testing.T) {
 			t.Parallel()
 			g := NewWithT(t)
 
-			agentTLSSecret := &corev1.Secret{
-				ObjectMeta: metav1.ObjectMeta{
-					Name:      agentTLSTestSecretName,
-					Namespace: ngfNamespace,
-				},
-				Data: map[string][]byte{secrets.TLSCertKey: []byte("tls")},
-			}
-			fakeClient := createFakeClientWithScheme(agentTLSSecret)
-
-			provisioner := &NginxProvisioner{
-				cfg: Config{
-					GatewayPodConfig: &config.GatewayPodConfig{
-						Namespace: ngfNamespace,
-						Version:   "1.0.0",
-					},
-					AgentTLSSecretName: agentTLSTestSecretName,
-					AgentLabels:        make(map[string]string),
-				},
-				baseLabelSelector: metav1.LabelSelector{
-					MatchLabels: map[string]string{"app": "nginx"},
-				},
-				k8sClient: fakeClient,
-			}
+			provisioner := makeProvisioner(test.gatewayCtlrName)
 
 			gateway := &gatewayv1.Gateway{
 				ObjectMeta: metav1.ObjectMeta{Name: "gw", Namespace: "default"},
@@ -2391,7 +2820,12 @@ func TestBuildNginxResourceObjects_ClusterIPWithExternalIPs(t *testing.T) {
 				},
 			}
 
-			objects, err := provisioner.buildNginxResourceObjects("gw-nginx", gateway, test.nProxyCfg)
+			objects, err := provisioner.buildNginxResourceObjects(
+				"gw-nginx",
+				gateway,
+				test.nProxyCfg,
+				graphListenersFromGateway(gateway),
+			)
 			g.Expect(err).ToNot(HaveOccurred())
 
 			var svc *corev1.Service
@@ -2402,9 +2836,482 @@ func TestBuildNginxResourceObjects_ClusterIPWithExternalIPs(t *testing.T) {
 				}
 			}
 			g.Expect(svc).ToNot(BeNil())
-			g.Expect(svc.Spec.Type).To(Equal(corev1.ServiceTypeClusterIP))
-			g.Expect(svc.Spec.ExternalIPs).To(Equal(test.expectedExternalIPs))
-			g.Expect(svc.Spec.ExternalTrafficPolicy).To(Equal(test.expectedExternalTrafficPolicy))
+			g.Expect(svc.Spec.ExternalIPs).To(BeNil())
+			if test.expectedLBClass == nil {
+				g.Expect(svc.Spec.LoadBalancerClass).To(BeNil())
+			} else {
+				g.Expect(svc.Spec.LoadBalancerClass).ToNot(BeNil())
+				g.Expect(*svc.Spec.LoadBalancerClass).To(Equal(*test.expectedLBClass))
+			}
+		})
+	}
+}
+
+func TestBuildNginxResourceObjects_WAF(t *testing.T) {
+	t.Parallel()
+	g := NewWithT(t)
+
+	agentTLSSecret := &corev1.Secret{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      agentTLSTestSecretName,
+			Namespace: ngfNamespace,
+		},
+		Data: map[string][]byte{secrets.TLSCertKey: []byte("tls")},
+	}
+	jwtSecret := &corev1.Secret{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      jwtTestSecretName,
+			Namespace: ngfNamespace,
+		},
+		Data: map[string][]byte{secrets.LicenseJWTKey: []byte("jwt")},
+	}
+	fakeClient := createFakeClientWithScheme(agentTLSSecret, jwtSecret)
+
+	provisioner := &NginxProvisioner{
+		cfg: Config{
+			Plus: true,
+			PlusUsageConfig: &config.UsageReportConfig{
+				SecretName: jwtTestSecretName,
+			},
+			GatewayPodConfig: &config.GatewayPodConfig{
+				Namespace: ngfNamespace,
+				Version:   "1.0.0",
+			},
+			AgentTLSSecretName: agentTLSTestSecretName,
+			AgentLabels:        make(map[string]string),
+		},
+		k8sClient: fakeClient,
+		baseLabelSelector: metav1.LabelSelector{
+			MatchLabels: map[string]string{"app": "nginx"},
+		},
+	}
+
+	gateway := &gatewayv1.Gateway{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      "gw",
+			Namespace: "default",
+		},
+		Spec: gatewayv1.GatewaySpec{
+			Listeners: []gatewayv1.Listener{{Port: 80}},
+		},
+	}
+
+	resourceName := "gw-nginx"
+	nProxyCfg := &graph.EffectiveNginxProxy{
+		WAF: &ngfAPIv1alpha2.WAFSpec{Enable: helpers.GetPointer(true)},
+		Kubernetes: &ngfAPIv1alpha2.KubernetesSpec{
+			Deployment: &ngfAPIv1alpha2.DeploymentSpec{
+				WAFContainers: &ngfAPIv1alpha2.WAFContainerSpec{
+					Enforcer: &ngfAPIv1alpha2.WAFContainerConfig{
+						Image: &ngfAPIv1alpha2.Image{
+							Repository: helpers.GetPointer("custom-registry/waf-enforcer"),
+							Tag:        helpers.GetPointer("custom-tag"),
+						},
+						Resources: &corev1.ResourceRequirements{
+							Requests: corev1.ResourceList{
+								corev1.ResourceMemory: resource.MustParse("512Mi"),
+								corev1.ResourceCPU:    resource.MustParse("200m"),
+							},
+						},
+						VolumeMounts: []corev1.VolumeMount{
+							{
+								Name:      "waf-logs",
+								MountPath: "/var/log/waf",
+							},
+						},
+					},
+					ConfigManager: &ngfAPIv1alpha2.WAFContainerConfig{
+						Image: &ngfAPIv1alpha2.Image{
+							Repository: helpers.GetPointer("custom-registry/waf-config-mgr"),
+							Tag:        helpers.GetPointer("config-tag"),
+						},
+						Resources: &corev1.ResourceRequirements{
+							Limits: corev1.ResourceList{
+								corev1.ResourceCPU: resource.MustParse("300m"),
+							},
+						},
+					},
+				},
+			},
+		},
+	}
+
+	objects, err := provisioner.buildNginxResourceObjects(
+		resourceName,
+		gateway,
+		nProxyCfg,
+		graphListenersFromGateway(gateway),
+	)
+	g.Expect(err).ToNot(HaveOccurred())
+
+	// 2 secrets (agentTLS, JWT) + 2 configmaps (includes, agent) + serviceaccount + service + deployment
+	g.Expect(objects).To(HaveLen(7))
+
+	dep := findDeployment(objects)
+	agentCM := findAgentConfigMap(objects)
+	g.Expect(dep).ToNot(BeNil())
+	g.Expect(agentCM).ToNot(BeNil())
+
+	// Verify agent ConfigMap contains WAF logs-nap feature
+	g.Expect(agentCM.Data[configmaps.AgentConfKey]).To(ContainSubstring("- configuration"))
+	g.Expect(agentCM.Data[configmaps.AgentConfKey]).To(ContainSubstring("- certificates"))
+	g.Expect(agentCM.Data[configmaps.AgentConfKey]).To(ContainSubstring("- logs-nap"))
+
+	template := dep.Spec.Template
+
+	// Should have 3 containers: nginx + waf-enforcer + waf-config-mgr
+	g.Expect(template.Spec.Containers).To(HaveLen(3))
+
+	// Validate NGINX container (first container)
+	nginxContainer := template.Spec.Containers[0]
+	g.Expect(nginxContainer.Name).To(Equal("nginx"))
+	g.Expect(nginxContainer.Image).To(Equal(fmt.Sprintf("%s:1.0.0", defaultNginxPlusWAFImagePath)))
+
+	// Check NGINX container has WAF volume mounts
+	wafVolumeMountNames := []string{
+		"app-protect-bundles",
+		"app-protect-config",
+		"app-protect-bd-config",
+		"app-protect-lock",
+	}
+
+	expectedNginxWAFMounts := map[string]string{
+		"app-protect-bundles":   "/etc/app_protect/bundles",
+		"app-protect-config":    "/opt/app_protect/config",
+		"app-protect-bd-config": "/opt/app_protect/bd_config",
+		"app-protect-lock":      "/opt/app_protect/lock",
+	}
+
+	for _, expectedMount := range wafVolumeMountNames {
+		found := false
+		for _, mount := range nginxContainer.VolumeMounts {
+			if mount.Name == expectedMount {
+				found = true
+				g.Expect(mount.MountPath).To(Equal(expectedNginxWAFMounts[expectedMount]))
+				break
+			}
+		}
+		g.Expect(found).To(BeTrue(), "NGINX container missing WAF volume mount: %s", expectedMount)
+	}
+
+	// Validate WAF Enforcer container (second container)
+	enforcerContainer := template.Spec.Containers[1]
+	g.Expect(enforcerContainer.Name).To(Equal("waf-enforcer"))
+	g.Expect(enforcerContainer.Image).To(Equal("custom-registry/waf-enforcer:custom-tag"))
+	g.Expect(enforcerContainer.ImagePullPolicy).To(Equal(defaultImagePullPolicy))
+
+	// Check enforcer resources
+	g.Expect(enforcerContainer.Resources.Requests).To(HaveKey(corev1.ResourceMemory))
+	g.Expect(enforcerContainer.Resources.Requests[corev1.ResourceMemory]).To(Equal(resource.MustParse("512Mi")))
+	g.Expect(enforcerContainer.Resources.Requests[corev1.ResourceCPU]).To(Equal(resource.MustParse("200m")))
+
+	// Check enforcer volume mounts (should have default + custom)
+	g.Expect(enforcerContainer.VolumeMounts).To(HaveLen(2))
+
+	// Default mount
+	defaultMount := false
+	customMount := false
+	for _, mount := range enforcerContainer.VolumeMounts {
+		if mount.Name == "app-protect-bd-config" && mount.MountPath == "/opt/app_protect/bd_config" {
+			defaultMount = true
+		}
+		if mount.Name == "waf-logs" && mount.MountPath == "/var/log/waf" {
+			customMount = true
+		}
+	}
+	g.Expect(defaultMount).To(BeTrue())
+	g.Expect(customMount).To(BeTrue())
+
+	// Validate WAF Config Manager container (third container)
+	configMgrContainer := template.Spec.Containers[2]
+	g.Expect(configMgrContainer.Name).To(Equal("waf-config-mgr"))
+	g.Expect(configMgrContainer.Image).To(Equal("custom-registry/waf-config-mgr:config-tag"))
+
+	// Check config manager security context
+	g.Expect(configMgrContainer.SecurityContext).ToNot(BeNil())
+	g.Expect(configMgrContainer.SecurityContext.AllowPrivilegeEscalation).To(Equal(helpers.GetPointer(false)))
+	g.Expect(configMgrContainer.SecurityContext.RunAsNonRoot).To(Equal(helpers.GetPointer(false)))
+	g.Expect(configMgrContainer.SecurityContext.RunAsUser).To(Equal(helpers.GetPointer[int64](101)))
+	g.Expect(configMgrContainer.SecurityContext.Capabilities.Drop).To(ContainElement(corev1.Capability("all")))
+
+	// Check config manager resources
+	g.Expect(configMgrContainer.Resources.Limits).To(HaveKey(corev1.ResourceCPU))
+	g.Expect(configMgrContainer.Resources.Limits[corev1.ResourceCPU]).To(Equal(resource.MustParse("300m")))
+
+	// Check config manager volume mounts (should have all 4 WAF volumes)
+	g.Expect(configMgrContainer.VolumeMounts).To(HaveLen(4))
+
+	expectedConfigMgrMounts := map[string]string{
+		"app-protect-bd-config": "/opt/app_protect/bd_config",
+		"app-protect-config":    "/opt/app_protect/config",
+		"app-protect-bundles":   "/etc/app_protect/bundles",
+		"app-protect-lock":      "/opt/app_protect/lock",
+	}
+
+	for _, mount := range configMgrContainer.VolumeMounts {
+		expectedPath, exists := expectedConfigMgrMounts[mount.Name]
+		g.Expect(exists).To(BeTrue(), "Unexpected volume mount in config manager: %s", mount.Name)
+		g.Expect(mount.MountPath).To(Equal(expectedPath))
+	}
+
+	// Validate WAF volumes are present in pod spec
+	volumeNames := make([]string, len(template.Spec.Volumes))
+	for i, volume := range template.Spec.Volumes {
+		volumeNames[i] = volume.Name
+	}
+
+	for _, expectedVolume := range wafVolumeMountNames {
+		g.Expect(volumeNames).To(ContainElement(expectedVolume))
+	}
+}
+
+func TestNginxContainerSecurityContext(t *testing.T) {
+	t.Parallel()
+	g := NewWithT(t)
+
+	provisioner := &NginxProvisioner{
+		cfg: Config{
+			GatewayPodConfig: &config.GatewayPodConfig{Version: "1.0.0"},
+		},
+	}
+
+	container := provisioner.buildNginxContainer(nil, nil)
+	g.Expect(container.SecurityContext).To(Equal(&corev1.SecurityContext{
+		Capabilities: &corev1.Capabilities{
+			Drop: []corev1.Capability{"ALL"},
+		},
+		AllowPrivilegeEscalation: helpers.GetPointer(false),
+		ReadOnlyRootFilesystem:   helpers.GetPointer(true),
+		RunAsGroup:               helpers.GetPointer[int64](1001),
+		RunAsUser:                helpers.GetPointer[int64](101),
+		SeccompProfile: &corev1.SeccompProfile{
+			Type: corev1.SeccompProfileTypeRuntimeDefault,
+		},
+	}))
+}
+
+func TestInitContainerSecurityContext(t *testing.T) {
+	t.Parallel()
+	g := NewWithT(t)
+
+	provisioner := &NginxProvisioner{
+		cfg: Config{
+			GatewayPodConfig: &config.GatewayPodConfig{
+				Version: "1.0.0",
+				Image:   "ngf-image",
+			},
+			AgentLabels: make(map[string]string),
+		},
+	}
+
+	initContainers := provisioner.buildInitContainers(nil)
+	g.Expect(initContainers).To(HaveLen(1))
+	g.Expect(initContainers[0].SecurityContext).To(Equal(&corev1.SecurityContext{
+		Capabilities: &corev1.Capabilities{
+			Drop: []corev1.Capability{"ALL"},
+		},
+		AllowPrivilegeEscalation: helpers.GetPointer(false),
+		ReadOnlyRootFilesystem:   helpers.GetPointer(true),
+		RunAsGroup:               helpers.GetPointer[int64](1001),
+		RunAsUser:                helpers.GetPointer[int64](101),
+		SeccompProfile: &corev1.SeccompProfile{
+			Type: corev1.SeccompProfileTypeRuntimeDefault,
+		},
+	}))
+}
+
+func TestDetermineNginxImageName(t *testing.T) {
+	t.Parallel()
+
+	tests := []struct {
+		nProxyCfg      *graph.EffectiveNginxProxy
+		name           string
+		version        string
+		expectedImage  string
+		expectedPolicy corev1.PullPolicy
+		isPlus         bool
+	}{
+		{
+			name:           "OSS default, no NginxProxy",
+			nProxyCfg:      nil,
+			isPlus:         false,
+			version:        "1.0.0",
+			expectedImage:  defaultNginxImagePath + ":1.0.0",
+			expectedPolicy: defaultImagePullPolicy,
+		},
+		{
+			name:           "Plus default, no NginxProxy",
+			nProxyCfg:      nil,
+			isPlus:         true,
+			version:        "1.0.0",
+			expectedImage:  defaultNginxPlusImagePath + ":1.0.0",
+			expectedPolicy: defaultImagePullPolicy,
+		},
+		{
+			name: "Plus WAF default, no container image override",
+			nProxyCfg: &graph.EffectiveNginxProxy{
+				WAF: &ngfAPIv1alpha2.WAFSpec{Enable: helpers.GetPointer(true)},
+			},
+			isPlus:         true,
+			version:        "1.0.0",
+			expectedImage:  defaultNginxPlusWAFImagePath + ":1.0.0",
+			expectedPolicy: defaultImagePullPolicy,
+		},
+		{
+			name: "Plus WAF with Helm-injected OSS default image should still use WAF image",
+			nProxyCfg: &graph.EffectiveNginxProxy{
+				WAF: &ngfAPIv1alpha2.WAFSpec{Enable: helpers.GetPointer(true)},
+				Kubernetes: &ngfAPIv1alpha2.KubernetesSpec{
+					Deployment: &ngfAPIv1alpha2.DeploymentSpec{
+						Container: ngfAPIv1alpha2.ContainerSpec{
+							Image: &ngfAPIv1alpha2.Image{
+								Repository: helpers.GetPointer(defaultNginxImagePath),
+								Tag:        helpers.GetPointer("edge"),
+								PullPolicy: helpers.GetPointer(ngfAPIv1alpha2.PullAlways),
+							},
+						},
+					},
+				},
+			},
+			isPlus:         true,
+			version:        "1.0.0",
+			expectedImage:  defaultNginxPlusWAFImagePath + ":edge",
+			expectedPolicy: corev1.PullAlways,
+		},
+		{
+			name: "Plus WAF with explicit Plus image should preserve user choice",
+			nProxyCfg: &graph.EffectiveNginxProxy{
+				WAF: &ngfAPIv1alpha2.WAFSpec{Enable: helpers.GetPointer(true)},
+				Kubernetes: &ngfAPIv1alpha2.KubernetesSpec{
+					Deployment: &ngfAPIv1alpha2.DeploymentSpec{
+						Container: ngfAPIv1alpha2.ContainerSpec{
+							Image: &ngfAPIv1alpha2.Image{
+								Repository: helpers.GetPointer(defaultNginxPlusImagePath),
+							},
+						},
+					},
+				},
+			},
+			isPlus:         true,
+			version:        "2.0.0",
+			expectedImage:  defaultNginxPlusImagePath + ":2.0.0",
+			expectedPolicy: defaultImagePullPolicy,
+		},
+		{
+			name: "Plus WAF with custom image should preserve user choice",
+			nProxyCfg: &graph.EffectiveNginxProxy{
+				WAF: &ngfAPIv1alpha2.WAFSpec{Enable: helpers.GetPointer(true)},
+				Kubernetes: &ngfAPIv1alpha2.KubernetesSpec{
+					Deployment: &ngfAPIv1alpha2.DeploymentSpec{
+						Container: ngfAPIv1alpha2.ContainerSpec{
+							Image: &ngfAPIv1alpha2.Image{
+								Repository: helpers.GetPointer("my-registry.example.com/custom-nginx"),
+								Tag:        helpers.GetPointer("custom-tag"),
+							},
+						},
+					},
+				},
+			},
+			isPlus:         true,
+			version:        "1.0.0",
+			expectedImage:  "my-registry.example.com/custom-nginx:custom-tag",
+			expectedPolicy: defaultImagePullPolicy,
+		},
+		{
+			name: "Plus WAF with DaemonSet and Helm-injected OSS default should still use WAF image",
+			nProxyCfg: &graph.EffectiveNginxProxy{
+				WAF: &ngfAPIv1alpha2.WAFSpec{Enable: helpers.GetPointer(true)},
+				Kubernetes: &ngfAPIv1alpha2.KubernetesSpec{
+					DaemonSet: &ngfAPIv1alpha2.DaemonSetSpec{
+						Container: ngfAPIv1alpha2.ContainerSpec{
+							Image: &ngfAPIv1alpha2.Image{
+								Repository: helpers.GetPointer(defaultNginxImagePath),
+							},
+						},
+					},
+				},
+			},
+			isPlus:         true,
+			version:        "1.0.0",
+			expectedImage:  defaultNginxPlusWAFImagePath + ":1.0.0",
+			expectedPolicy: defaultImagePullPolicy,
+		},
+		{
+			name: "Plus without WAF and Helm-injected OSS default should use Plus image",
+			nProxyCfg: &graph.EffectiveNginxProxy{
+				Kubernetes: &ngfAPIv1alpha2.KubernetesSpec{
+					Deployment: &ngfAPIv1alpha2.DeploymentSpec{
+						Container: ngfAPIv1alpha2.ContainerSpec{
+							Image: &ngfAPIv1alpha2.Image{
+								Repository: helpers.GetPointer(defaultNginxImagePath),
+							},
+						},
+					},
+				},
+			},
+			isPlus:         true,
+			version:        "1.0.0",
+			expectedImage:  defaultNginxPlusImagePath + ":1.0.0",
+			expectedPolicy: defaultImagePullPolicy,
+		},
+		{
+			name: "Plus without WAF and custom image should preserve user choice",
+			nProxyCfg: &graph.EffectiveNginxProxy{
+				Kubernetes: &ngfAPIv1alpha2.KubernetesSpec{
+					Deployment: &ngfAPIv1alpha2.DeploymentSpec{
+						Container: ngfAPIv1alpha2.ContainerSpec{
+							Image: &ngfAPIv1alpha2.Image{
+								Repository: helpers.GetPointer("my-registry.example.com/my-nginx-plus"),
+								Tag:        helpers.GetPointer("v2"),
+							},
+						},
+					},
+				},
+			},
+			isPlus:         true,
+			version:        "1.0.0",
+			expectedImage:  "my-registry.example.com/my-nginx-plus:v2",
+			expectedPolicy: defaultImagePullPolicy,
+		},
+		{
+			name: "Plus WAF with explicit Plus image via DaemonSet should preserve user choice",
+			nProxyCfg: &graph.EffectiveNginxProxy{
+				WAF: &ngfAPIv1alpha2.WAFSpec{Enable: helpers.GetPointer(true)},
+				Kubernetes: &ngfAPIv1alpha2.KubernetesSpec{
+					DaemonSet: &ngfAPIv1alpha2.DaemonSetSpec{
+						Container: ngfAPIv1alpha2.ContainerSpec{
+							Image: &ngfAPIv1alpha2.Image{
+								Repository: helpers.GetPointer(defaultNginxPlusImagePath),
+							},
+						},
+					},
+				},
+			},
+			isPlus:         true,
+			version:        "3.0.0",
+			expectedImage:  defaultNginxPlusImagePath + ":3.0.0",
+			expectedPolicy: defaultImagePullPolicy,
+		},
+		{
+			name: "OSS with WAF enabled should not switch to WAF image",
+			nProxyCfg: &graph.EffectiveNginxProxy{
+				WAF: &ngfAPIv1alpha2.WAFSpec{Enable: helpers.GetPointer(true)},
+			},
+			isPlus:         false,
+			version:        "1.0.0",
+			expectedImage:  defaultNginxImagePath + ":1.0.0",
+			expectedPolicy: defaultImagePullPolicy,
+		},
+	}
+
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			t.Parallel()
+			g := NewWithT(t)
+
+			image, pullPolicy := DetermineNginxImageName(test.nProxyCfg, test.isPlus, test.version)
+			g.Expect(image).To(Equal(test.expectedImage))
+			g.Expect(pullPolicy).To(Equal(test.expectedPolicy))
 		})
 	}
 }

@@ -3,6 +3,7 @@ package graph
 import (
 	"encoding/json"
 	"fmt"
+	"regexp"
 	"slices"
 
 	"k8s.io/apimachinery/pkg/types"
@@ -21,6 +22,7 @@ var (
 	ServerTokenOff   = "off"
 	ServerTokenOn    = "on"
 	ServerTokenBuild = "build"
+	mimeTypePattern  = regexp.MustCompile(`^[A-Za-z0-9!#$%&'+.^_` + "`" + `|~-]+/[A-Za-z0-9!#$%&'+.^_` + "`" + `|~-]+$`)
 )
 
 // NginxProxy represents the NginxProxy resource.
@@ -55,6 +57,7 @@ func buildEffectiveNginxProxy(gatewayClassNp, gatewayNp *NginxProxy) *EffectiveN
 		return &enp
 	}
 
+	gcSpec := EffectiveNginxProxy(*gatewayClassNp.Source.Spec.DeepCopy())
 	global := EffectiveNginxProxy(*gatewayClassNp.Source.Spec.DeepCopy())
 	local := EffectiveNginxProxy(*gatewayNp.Source.Spec.DeepCopy())
 
@@ -82,37 +85,94 @@ func buildEffectiveNginxProxy(gatewayClassNp, gatewayNp *NginxProxy) *EffectiveN
 
 	// Clean up the effective configuration by handling slice unsetting and other cases
 	// that are not handled by JSON merging, such as mutual exclusivity between fields.
-	cleanupEffectiveNginxProxy(&local, &global)
+	cleanupEffectiveNginxProxy(&local, &global, &gcSpec)
 
 	return &global
 }
 
 // cleanupEffectiveNginxProxy handles post-JSON merge cleanup for the effective NginxProxy configuration.
 // This includes manually unsetting slices and handling mutual exclusion between certain fields.
-func cleanupEffectiveNginxProxy(local, global *EffectiveNginxProxy) {
-	// Handle slice unsetting, JSON unmarshaling doesn't clear slices when they're set to empty
-	if local.Telemetry != nil {
-		if local.Telemetry.DisabledFeatures != nil && len(local.Telemetry.DisabledFeatures) == 0 {
-			global.Telemetry.DisabledFeatures = []ngfAPIv1alpha2.DisableTelemetryFeature{}
-		}
+// gcSpec is the pre-merge GatewayClass spec, used to restore sub-fields dropped when a Gateway
+// partially overrides a nested struct (e.g. sets waf.disableCookieSeed but not waf.enabled).
+func cleanupEffectiveNginxProxy(local, global, gcSpec *EffectiveNginxProxy) {
+	cleanupTelemetry(local, global)
+	cleanupRewriteClientIP(local, global)
+	cleanupKubernetes(local, global)
+	cleanupWAF(local, global, gcSpec)
+	cleanupCompression(local, global)
+}
 
-		if local.Telemetry.SpanAttributes != nil && len(local.Telemetry.SpanAttributes) == 0 {
-			global.Telemetry.SpanAttributes = []ngfAPIv1alpha1.SpanAttribute{}
-		}
+// cleanupTelemetry resets empty slices that JSON unmarshal cannot clear.
+func cleanupTelemetry(local, global *EffectiveNginxProxy) {
+	if local.Telemetry == nil {
+		return
 	}
-
-	if local.RewriteClientIP != nil {
-		if local.RewriteClientIP.TrustedAddresses != nil && len(local.RewriteClientIP.TrustedAddresses) == 0 {
-			global.RewriteClientIP.TrustedAddresses = []ngfAPIv1alpha2.RewriteClientIPAddress{}
-		}
+	if len(local.Telemetry.DisabledFeatures) == 0 && local.Telemetry.DisabledFeatures != nil {
+		global.Telemetry.DisabledFeatures = []ngfAPIv1alpha2.DisableTelemetryFeature{}
 	}
+	if len(local.Telemetry.SpanAttributes) == 0 && local.Telemetry.SpanAttributes != nil {
+		global.Telemetry.SpanAttributes = []ngfAPIv1alpha1.SpanAttribute{}
+	}
+}
 
-	// Handle mutual exclusion between DaemonSet and Deployment
-	if local.Kubernetes != nil && global.Kubernetes != nil {
-		if local.Kubernetes.DaemonSet != nil && global.Kubernetes.Deployment != nil {
-			global.Kubernetes.Deployment = nil
-		} else if local.Kubernetes.Deployment != nil && global.Kubernetes.DaemonSet != nil {
-			global.Kubernetes.DaemonSet = nil
+// cleanupRewriteClientIP resets empty slices that JSON unmarshal cannot clear.
+func cleanupRewriteClientIP(local, global *EffectiveNginxProxy) {
+	if local.RewriteClientIP == nil {
+		return
+	}
+	if len(local.RewriteClientIP.TrustedAddresses) == 0 && local.RewriteClientIP.TrustedAddresses != nil {
+		global.RewriteClientIP.TrustedAddresses = []ngfAPIv1alpha2.RewriteClientIPAddress{}
+	}
+}
+
+// cleanupKubernetes enforces mutual exclusion between DaemonSet and Deployment.
+func cleanupKubernetes(local, global *EffectiveNginxProxy) {
+	if local.Kubernetes == nil || global.Kubernetes == nil {
+		return
+	}
+	if local.Kubernetes.DaemonSet != nil && global.Kubernetes.Deployment != nil {
+		global.Kubernetes.Deployment = nil
+	} else if local.Kubernetes.Deployment != nil && global.Kubernetes.DaemonSet != nil {
+		global.Kubernetes.DaemonSet = nil
+	}
+}
+
+// cleanupWAF restores WAFSpec fields that the Gateway left nil so they inherit from the GatewayClass.
+// When a Gateway NginxProxy sets the waf object partially (e.g. only disableCookieSeed), the JSON
+// merge overwrites the entire waf struct in global with the Gateway's value, dropping any sub-fields
+// the Gateway did not specify. This restores those nil sub-fields from the pre-merge GatewayClass spec.
+func cleanupWAF(local, global, gcSpec *EffectiveNginxProxy) {
+	if local.WAF == nil || gcSpec.WAF == nil {
+		return
+	}
+	if local.WAF.Enable == nil {
+		global.WAF.Enable = gcSpec.WAF.Enable
+	}
+	if local.WAF.DisableCookieSeed == nil {
+		global.WAF.DisableCookieSeed = gcSpec.WAF.DisableCookieSeed
+	}
+	if local.WAF.BundleFailOpen == nil {
+		global.WAF.BundleFailOpen = gcSpec.WAF.BundleFailOpen
+	}
+}
+
+// cleanupCompression resets empty slices in the compression config that JSON unmarshal cannot clear.
+func cleanupCompression(local, global *EffectiveNginxProxy) {
+	if local.Compression == nil {
+		return
+	}
+	if local.Compression.MimeTypes != nil && len(local.Compression.MimeTypes) == 0 {
+		global.Compression.MimeTypes = []string{}
+	}
+	if local.Compression.Gzip != nil {
+		if global.Compression.Gzip == nil {
+			global.Compression.Gzip = &ngfAPIv1alpha2.GzipSettings{}
+		}
+		if local.Compression.Gzip.Proxied != nil && len(local.Compression.Gzip.Proxied) == 0 {
+			global.Compression.Gzip.Proxied = []ngfAPIv1alpha2.GzipProxiedType{}
+		}
+		if local.Compression.Gzip.Disable != nil && len(local.Compression.Gzip.Disable) == 0 {
+			global.Compression.Gzip.Disable = []string{}
 		}
 	}
 }
@@ -122,7 +182,7 @@ func nginxProxyValid(np *NginxProxy) bool {
 }
 
 func telemetryEnabledForNginxProxy(np *EffectiveNginxProxy) bool {
-	if np.Telemetry == nil || np.Telemetry.Exporter == nil || np.Telemetry.Exporter.Endpoint == nil {
+	if np == nil || np.Telemetry == nil || np.Telemetry.Exporter == nil || np.Telemetry.Exporter.Endpoint == nil {
 		return false
 	}
 
@@ -144,6 +204,21 @@ func MetricsEnabledForNginxProxy(np *EffectiveNginxProxy) (*int32, bool) {
 	}
 
 	return nil, true
+}
+
+// WAFEnabledForNginxProxy returns whether WAF is enabled for the given NginxProxy configuration.
+func WAFEnabledForNginxProxy(np *EffectiveNginxProxy) bool {
+	return np != nil && np.WAF != nil && np.WAF.Enable != nil && *np.WAF.Enable
+}
+
+// WAFCookieSeedDisabledForNginxProxy returns whether the app_protect_cookie_seed directive is disabled.
+func WAFCookieSeedDisabledForNginxProxy(np *EffectiveNginxProxy) bool {
+	return np != nil && np.WAF != nil && np.WAF.DisableCookieSeed != nil && *np.WAF.DisableCookieSeed
+}
+
+// WAFBundleFailOpenForNginxProxy returns whether fail-open is enabled for WAF bundle fetching.
+func WAFBundleFailOpenForNginxProxy(np *EffectiveNginxProxy) bool {
+	return np != nil && np.WAF != nil && np.WAF.BundleFailOpen != nil && *np.WAF.BundleFailOpen
 }
 
 func processNginxProxies(
@@ -296,7 +371,7 @@ func validateNginxProxy(
 		}
 	}
 
-	allErrs = append(allErrs, validateLogging(npCfg)...)
+	allErrs = append(allErrs, validateLogging(validator, npCfg, plus)...)
 
 	allErrs = append(allErrs, validateDNSResolver(validator, npCfg)...)
 
@@ -304,12 +379,18 @@ func validateNginxProxy(
 
 	allErrs = append(allErrs, validateNginxPlus(npCfg)...)
 
-	allErrs = append(allErrs, validateServerTokens(npCfg, plus)...)
+	allErrs = append(allErrs, validateServerTokens(validator, npCfg, plus)...)
+
+	allErrs = append(allErrs, validateCompression(validator, npCfg)...)
 
 	return allErrs
 }
 
-func validateLogging(npCfg *ngfAPIv1alpha2.NginxProxy) field.ErrorList {
+func validateLogging(
+	validator validation.GenericValidator,
+	npCfg *ngfAPIv1alpha2.NginxProxy,
+	plus bool,
+) field.ErrorList {
 	var allErrs field.ErrorList
 	spec := field.NewPath("spec")
 
@@ -339,6 +420,33 @@ func validateLogging(npCfg *ngfAPIv1alpha2.NginxProxy) field.ErrorList {
 						logging.ErrorLevel,
 						validLogLevels,
 					))
+			}
+		}
+
+		if logging.ErrorLogFormat != nil && *logging.ErrorLogFormat == ngfAPIv1alpha2.NginxErrorLogFormatJSON && !plus {
+			allErrs = append(
+				allErrs,
+				field.Invalid(
+					loggingPath.Child("errorLogFormat"),
+					*logging.ErrorLogFormat,
+					"JSON-formatted error logs are only supported with NGINX Plus",
+				),
+			)
+		}
+
+		if logging.AccessLog != nil && logging.AccessLog.Format != nil {
+			accessLogFormatPath := loggingPath.Child("accessLog", "format")
+			accessLogFormat := *logging.AccessLog.Format
+
+			if err := validator.ValidateAccessLogFormatString(accessLogFormat); err != nil {
+				allErrs = append(
+					allErrs,
+					field.Invalid(
+						accessLogFormatPath,
+						accessLogFormat,
+						err.Error(),
+					),
+				)
 			}
 		}
 	}
@@ -531,18 +639,24 @@ func validateNginxPlus(npCfg *ngfAPIv1alpha2.NginxProxy) field.ErrorList {
 	return allErrs
 }
 
-func validateServerTokens(npCfg *ngfAPIv1alpha2.NginxProxy, plus bool) field.ErrorList {
+func validateServerTokens(
+	validator validation.GenericValidator,
+	npCfg *ngfAPIv1alpha2.NginxProxy,
+	plus bool,
+) field.ErrorList {
+	if npCfg.Spec.ServerTokens == nil {
+		return nil
+	}
+
 	var allErrs field.ErrorList
-	spec := field.NewPath("spec")
+	serverTokens := *npCfg.Spec.ServerTokens
+	serverTokensPath := field.NewPath("spec").Child("serverTokens")
 
-	if npCfg.Spec.ServerTokens != nil && !plus {
-		serverTokens := *npCfg.Spec.ServerTokens
-		serverTokensPath := spec.Child("serverTokens")
-
-		switch serverTokens {
-		case ServerTokenOff, ServerTokenOn, ServerTokenBuild:
-			// only keyword server_tokens off|on|build is allowed in OSS
-		default:
+	switch serverTokens {
+	case ServerTokenOff, ServerTokenOn, ServerTokenBuild:
+		// keywords are always valid for both OSS and Plus
+	default:
+		if !plus {
 			allErrs = append(
 				allErrs,
 				field.Invalid(
@@ -552,7 +666,75 @@ func validateServerTokens(npCfg *ngfAPIv1alpha2.NginxProxy, plus bool) field.Err
 						" For NGINX OSS, allowed values are 'off', 'on', and 'build'.",
 				),
 			)
+		} else if err := validator.ValidateServerTokensValue(serverTokens); err != nil {
+			allErrs = append(
+				allErrs,
+				field.Invalid(serverTokensPath, serverTokens, err.Error()),
+			)
 		}
 	}
+	return allErrs
+}
+
+func validateCompression(
+	validator validation.GenericValidator,
+	npCfg *ngfAPIv1alpha2.NginxProxy,
+) field.ErrorList {
+	if npCfg.Spec.Compression == nil {
+		return nil
+	}
+
+	var allErrs field.ErrorList
+	compressionPath := field.NewPath("spec").Child("compression")
+
+	for i, mimeType := range npCfg.Spec.Compression.MimeTypes {
+		if !mimeTypePattern.MatchString(mimeType) {
+			allErrs = append(
+				allErrs,
+				field.Invalid(
+					compressionPath.Child("mimeTypes").Index(i),
+					mimeType,
+					"must be a valid MIME type with the form type/subtype",
+				),
+			)
+		}
+	}
+
+	if npCfg.Spec.Compression.Gzip != nil {
+		gzipPath := compressionPath.Child("gzip")
+		for i, d := range npCfg.Spec.Compression.Gzip.Disable {
+			if err := validator.ValidateEscapedStringNoVarExpansion(d); err != nil {
+				allErrs = append(
+					allErrs,
+					field.Invalid(gzipPath.Child("disable").Index(i), d, err.Error()),
+				)
+			}
+		}
+
+		validGzipProxied := []ngfAPIv1alpha2.GzipProxiedType{
+			ngfAPIv1alpha2.GzipProxiedOff,
+			ngfAPIv1alpha2.GzipProxiedExpired,
+			ngfAPIv1alpha2.GzipProxiedNoCache,
+			ngfAPIv1alpha2.GzipProxiedNoStore,
+			ngfAPIv1alpha2.GzipProxiedPrivate,
+			ngfAPIv1alpha2.GzipProxiedNoLastModified,
+			ngfAPIv1alpha2.GzipProxiedNoETag,
+			ngfAPIv1alpha2.GzipProxiedAuth,
+			ngfAPIv1alpha2.GzipProxiedAny,
+		}
+		for i, p := range npCfg.Spec.Compression.Gzip.Proxied {
+			if !slices.Contains(validGzipProxied, p) {
+				allErrs = append(
+					allErrs,
+					field.Invalid(
+						gzipPath.Child("proxied").Index(i),
+						p,
+						"invalid value; must be one of: off, expired, no-cache, no-store, private, no_last_modified, no_etag, auth, any",
+					),
+				)
+			}
+		}
+	}
+
 	return allErrs
 }

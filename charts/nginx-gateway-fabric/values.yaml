@@ -3,6 +3,9 @@
 # -- The DNS cluster domain of your Kubernetes cluster.
 clusterDomain: cluster.local
 
+# -- The domain suffix used in the server TLS certificate SAN and agent config host. Defaults to "svc".
+serverTLSDomain: svc
+
 # -- The nginxGateway section contains configuration for the NGINX Gateway Fabric control plane deployment.
 nginxGateway:
   # @schema
@@ -16,6 +19,9 @@ nginxGateway:
 
   # -- List of namespaces to watch for resources. If not set, all namespaces are watched.
   # The controller's own namespace is always included.
+  # NOTE: If PLM is installed and configured via nginxGateway.plmStorage, ensure PLM's
+  # policyController.watchNamespace covers the namespaces where APPolicy and APLogConf
+  # resources will be created.
   watchNamespaces: []
 
   # @schema
@@ -84,6 +90,12 @@ nginxGateway:
     # Secrets must exist in the same namespace as the helm release.
     imagePullSecrets: []
 
+    # -- automountServiceAccountToken controls whether the Kubernetes service account token is automatically
+    # mounted into the control plane pod. Set to false to disable automatic token mounting (e.g. for
+    # compliance environments). When disabled, use nginxGateway.extraVolumes to mount a projected token
+    # with a custom audience or expiration if required.
+    automountServiceAccountToken: true
+
   # -- The number of replicas of the NGINX Gateway Fabric Deployment. This value is ignored if autoscaling.enable is true.
   replicas: 1
 
@@ -113,8 +125,40 @@ nginxGateway:
     # -- Port in which the readiness endpoint is exposed.
     port: 8081
 
+    # @schema
+    # type: integer
+    # minimum: 0
+    # @schema
     # -- The number of seconds after the Pod has started before the readiness probes are initiated.
     initialDelaySeconds: 3
+
+    # @schema
+    # type: integer
+    # minimum: 1
+    # @schema
+    # -- How often (in seconds) to perform the readiness probe.
+    periodSeconds: 10
+
+    # @schema
+    # type: integer
+    # minimum: 1
+    # @schema
+    # -- The number of retries after a failed probe before marking the container as Unready.
+    failureThreshold: 3
+
+    # @schema
+    # type: integer
+    # minimum: 1
+    # @schema
+    # -- Number of seconds after which the probe times out.
+    timeoutSeconds: 1
+
+    # @schema
+    # type: integer
+    # minimum: 1
+    # @schema
+    # -- Minimum consecutive successes for the probe to be considered successful after having failed.
+    successThreshold: 1
 
   # -- The image configuration for the NGINX Gateway Fabric control plane.
   image:
@@ -133,8 +177,25 @@ nginxGateway:
     # -- Enable the collection of product telemetry.
     enable: true
 
+  # @schema
+  # type: object
+  # description: The lifecycle hooks for the nginx-gateway container. See https://kubernetes.io/docs/tasks/configure-pod-container/define-lifecycle-hook/
+  # @schema
   # -- The lifecycle of the nginx-gateway container.
   lifecycle: {}
+  # -- Example:
+  #   preStop:
+  #     exec:
+  #       command:
+  #         - /bin/sh
+  #         - -c
+  #         - sleep 10
+  #   postStart:
+  #     exec:
+  #       command:
+  #         - /bin/sh
+  #         - -c
+  #         - echo "Started"
 
   # -- The resource requests and/or limits of the nginx-gateway container.
   resources: {}
@@ -201,6 +262,34 @@ nginxGateway:
     #     target:
     #       type: AverageValue
     #       averageValue: "400Mi"
+
+  # -- PodDisruptionBudget configuration for the NGINX Gateway Fabric control plane.
+  podDisruptionBudget:
+    # -- Enable or disable PodDisruptionBudget for the control plane.
+    enable: false
+    # @schema
+    # anyOf:
+    #   - type: integer
+    #   - type: string
+    # @schema
+    # -- Minimum number of pods that must be available after an eviction. Value can be an absolute number (e.g. 1) or a percentage (e.g. 50%). Mutually exclusive with maxUnavailable.
+    minAvailable: ""
+    # @schema
+    # anyOf:
+    #   - type: integer
+    #   - type: string
+    # @schema
+    # -- Maximum number of pods that can be unavailable after an eviction. Value can be an absolute number (e.g. 1) or a percentage (e.g. 50%). Mutually exclusive with minAvailable.
+    maxUnavailable: ""
+    # @schema
+    # enum:
+    #   - ""
+    #   - IfHealthyBudget
+    #   - AlwaysAllow
+    # @schema
+    # -- Defines when unhealthy pods should be considered for eviction. Valid values are IfHealthyBudget and AlwaysAllow.
+    unhealthyPodEvictionPolicy: ""
+
   metrics:
     # -- Enable exposing metrics in the Prometheus format.
     enable: true
@@ -249,6 +338,30 @@ nginxGateway:
     # and SnippetsPolicies. Enable SnippetsFilters feature. SnippetsFilters allow inserting NGINX configuration into
     # the generated NGINX config for HTTPRoute and GRPCRoute resources.
     enable: false
+
+  # Configuration for PLM (Policy Lifecycle Manager) S3-compatible storage.
+  # Required when any WAFPolicy uses type: PLM.
+  # PLM (f5-waf-policy-controller) must be installed separately.
+  plmStorage:
+    # -- The URL of the PLM S3-compatible storage endpoint (SeaweedFS filer S3 gateway).
+    # Example: https://my-release-f5-waf-seaweed-filer.plm-namespace.svc.cluster.local:9333
+    url: ""
+
+    # -- The name of the Secret containing S3 credentials for PLM storage.
+    # Use "namespace/name" format for cross-namespace references, or plain "name" for the controller namespace.
+    credentialsSecretName: ""
+
+    tls:
+      # -- The name of the Secret containing the CA certificate for PLM storage TLS verification.
+      # Use "namespace/name" format for cross-namespace references.
+      caSecretName: ""
+
+      # -- The name of the Secret containing client TLS certificate and key for mutual TLS with PLM storage.
+      # Use "namespace/name" format for cross-namespace references.
+      clientSSLSecretName: ""
+
+      # -- Disable TLS certificate verification for PLM storage connections (dev/test only).
+      insecureSkipVerify: false
 
 # -- The nginx section contains the configuration for all NGINX data plane deployments
 # installed by the NGINX Gateway Fabric control plane.
@@ -564,6 +677,19 @@ nginx:
   #   serverTokens:
   #     type: string
   #     description: Sets the `server_tokens` directive. Accepts 'off', 'on', or 'build' for NGINX OSS, and any string or variable for NGINX Plus.
+  #   waf:
+  #     description: WAF configures NGINX App Protect WAF.
+  #     type: object
+  #     properties:
+  #       enabled:
+  #         description: Enabled enables NGINX App Protect WAF functionality.
+  #         type: boolean
+  #       disableCookieSeed:
+  #         description: DisableCookieSeed disables the app_protect_cookie_seed directive.
+  #         type: boolean
+  #       bundleFailOpen:
+  #         description: BundleFailOpen controls the behavior when a WAF policy bundle has not yet been successfully fetched. When true, traffic is served without WAF protection until the bundle is available. When false (default), configuration is withheld until the bundle is fetched.
+  #         type: boolean
   # @schema
   # -- The configuration for the data plane that is contained in the NginxProxy resource. This is applied globally to all Gateways
   # managed by this instance of NGINX Gateway Fabric.
@@ -623,8 +749,25 @@ nginx:
     # -- The resource requirements of the NGINX container. You should set this value if you want to use dataplane Autoscaling(HPA).
     resources: {}
 
+    # @schema
+    # type: object
+    # description: The lifecycle hooks for the NGINX container. See https://kubernetes.io/docs/tasks/configure-pod-container/define-lifecycle-hook/
+    # @schema
     # -- The lifecycle of the NGINX container.
     lifecycle: {}
+    # -- Example:
+    #   preStop:
+    #     exec:
+    #       command:
+    #         - /bin/sh
+    #         - -c
+    #         - sleep 10
+    #   postStart:
+    #     exec:
+    #       command:
+    #         - /bin/sh
+    #         - -c
+    #         - echo "Started"
 
     # -- volumeMounts are the additional volume mounts for the NGINX container.
     volumeMounts: []
@@ -641,6 +784,32 @@ nginx:
 
       # -- The number of seconds after the Pod has started before the readiness probes are initiated.
       # initialDelaySeconds: 3
+  # -- Configuration for NGINX App Protect WAF v5 containers.
+  # These containers are only deployed when WAF is enabled via nginx.config.waf.enable: true.
+  # All settings are optional overrides - defaults are provided by NGF.
+  wafContainers: {}
+    # -- WAF Enforcer container configuration.
+    # enforcer:
+    #   image: {}
+
+    # -- The resource requirements of the WAF Enforcer container.
+    #   resources: {}
+    #
+    #   # -- Additional volume mounts for the WAF enforcer container.
+    #   # NAP v5 shared volumes are automatically configured by NGF.
+    #   volumeMounts: []
+
+    # -- WAF Configuration Manager container configuration.
+    # configManager:
+    #   # -- Container image configuration
+    #   image: {}
+    #
+    #   # -- The resource requirements of the WAF config manager container.
+    #   resources: {}
+
+    #   # -- Additional volume mounts for the WAF config manager container.
+    #   # NAP v5 shared volumes are automatically configured by NGF.
+    #   volumeMounts: []
 
   # -- The service configuration for the NGINX data plane. This is applied globally to all Gateways managed by this
   # instance of NGINX Gateway Fabric.
@@ -740,6 +909,18 @@ certGenerator:
 
   # -- The topology spread constraints for the cert-generator pod.
   topologySpreadConstraints: []
+
+  # -- automountServiceAccountToken controls whether the Kubernetes service account token is automatically
+  # mounted into the cert-generator pod. Set to false to disable automatic token mounting.
+  # When disabled, use certGenerator.extraVolumes to mount a projected token if required.
+  automountServiceAccountToken: true
+
+  # -- extraVolumes for the cert-generator pod. Use in conjunction with certGenerator.extraVolumeMounts
+  # to mount additional volumes into the container (e.g. a projected service account token).
+  extraVolumes: []
+
+  # -- extraVolumeMounts are the additional volume mounts for the cert-generator container.
+  extraVolumeMounts: []
 
 # -- A list of Gateway objects. View https://gateway-api.sigs.k8s.io/reference/spec/#gateway for full Gateway reference.
 gateways: []

@@ -12,6 +12,7 @@ import (
 
 	"github.com/nginx/nginx-gateway-fabric/v2/internal/controller/state/conditions"
 	"github.com/nginx/nginx-gateway-fabric/v2/internal/framework/helpers"
+	"github.com/nginx/nginx-gateway-fabric/v2/internal/framework/kinds"
 )
 
 func createUDPRoute(
@@ -35,10 +36,30 @@ func createUDPRoute(
 func TestBuildUDPRoute(t *testing.T) {
 	t.Parallel()
 
-	parentRef := gatewayv1.ParentReference{
+	gatewayParentRef := gatewayv1.ParentReference{
 		Namespace:   helpers.GetPointer[gatewayv1.Namespace]("test"),
 		Name:        "gateway",
 		SectionName: helpers.GetPointer[gatewayv1.SectionName]("l1"),
+		Kind:        helpers.GetPointer[gatewayv1.Kind](kinds.Gateway),
+	}
+
+	listenerSetParentRef := gatewayv1.ParentReference{
+		Namespace:   helpers.GetPointer[gatewayv1.Namespace]("test"),
+		Name:        "listener-set",
+		SectionName: helpers.GetPointer[gatewayv1.SectionName]("ls-l1"),
+		Kind:        helpers.GetPointer[gatewayv1.Kind](kinds.ListenerSet),
+	}
+
+	listenerSets := map[types.NamespacedName]*ListenerSet{
+		{Namespace: "test", Name: "listener-set"}: {
+			Source: &gatewayv1.ListenerSet{
+				ObjectMeta: metav1.ObjectMeta{
+					Namespace: "test",
+					Name:      "listener-set",
+				},
+			},
+			Valid: true,
+		},
 	}
 
 	createGateway := func() *Gateway {
@@ -53,13 +74,25 @@ func TestBuildUDPRoute(t *testing.T) {
 		}
 	}
 
-	parentRefGraph := ParentRef{
+	gatewayParentRefGraph := ParentRef{
 		SectionName: helpers.GetPointer[gatewayv1.SectionName]("l1"),
-		Gateway: &ParentRefGateway{
-			NamespacedName: types.NamespacedName{
-				Namespace: "test",
-				Name:      "gateway",
-			},
+		Kind:        gatewayv1.Kind(kinds.Gateway),
+		NamespacedName: types.NamespacedName{
+			Namespace: "test",
+			Name:      "gateway",
+		},
+		GatewayNsName: types.NamespacedName{
+			Namespace: "test",
+			Name:      "gateway",
+		},
+	}
+
+	listenerSetParentRefGraph := ParentRef{
+		SectionName: helpers.GetPointer[gatewayv1.SectionName]("ls-l1"),
+		Kind:        gatewayv1.Kind(kinds.ListenerSet),
+		NamespacedName: types.NamespacedName{
+			Namespace: "test",
+			Name:      "listener-set",
 		},
 	}
 
@@ -67,8 +100,8 @@ func TestBuildUDPRoute(t *testing.T) {
 	duplicateParentRefsUDPR := createUDPRoute(
 		nil,
 		[]gatewayv1.ParentReference{
-			parentRef,
-			parentRef,
+			gatewayParentRef,
+			gatewayParentRef,
 		},
 	)
 
@@ -80,7 +113,7 @@ func TestBuildUDPRoute(t *testing.T) {
 	noRulesUDPR := createUDPRoute(
 		nil,
 		[]gatewayv1.ParentReference{
-			parentRef,
+			gatewayParentRef,
 		},
 	)
 
@@ -98,7 +131,7 @@ func TestBuildUDPRoute(t *testing.T) {
 			},
 		},
 		[]gatewayv1.ParentReference{
-			parentRef,
+			gatewayParentRef,
 		},
 	)
 
@@ -117,7 +150,7 @@ func TestBuildUDPRoute(t *testing.T) {
 			},
 		},
 		[]gatewayv1.ParentReference{
-			parentRef,
+			gatewayParentRef,
 		},
 	)
 
@@ -136,7 +169,7 @@ func TestBuildUDPRoute(t *testing.T) {
 			},
 		},
 		[]gatewayv1.ParentReference{
-			parentRef,
+			gatewayParentRef,
 		},
 	)
 
@@ -155,7 +188,7 @@ func TestBuildUDPRoute(t *testing.T) {
 			},
 		},
 		[]gatewayv1.ParentReference{
-			parentRef,
+			gatewayParentRef,
 		},
 	)
 
@@ -172,7 +205,7 @@ func TestBuildUDPRoute(t *testing.T) {
 			},
 		},
 		[]gatewayv1.ParentReference{
-			parentRef,
+			gatewayParentRef,
 		},
 	)
 
@@ -191,7 +224,7 @@ func TestBuildUDPRoute(t *testing.T) {
 			},
 		},
 		[]gatewayv1.ParentReference{
-			parentRef,
+			gatewayParentRef,
 		},
 	)
 
@@ -218,7 +251,7 @@ func TestBuildUDPRoute(t *testing.T) {
 			},
 		},
 		[]gatewayv1.ParentReference{
-			parentRef,
+			gatewayParentRef,
 		},
 	)
 
@@ -247,7 +280,26 @@ func TestBuildUDPRoute(t *testing.T) {
 			},
 		},
 		[]gatewayv1.ParentReference{
-			parentRef,
+			gatewayParentRef,
+		},
+	)
+
+	// Valid UDPRoute with ListenerSet parent ref
+	validUDPRWithListenerSetParentRef := createUDPRoute(
+		[]v1alpha2.UDPRouteRule{
+			{
+				BackendRefs: []gatewayv1.BackendRef{
+					{
+						BackendObjectReference: gatewayv1.BackendObjectReference{
+							Name: "svc1",
+							Port: helpers.GetPointer[gatewayv1.PortNumber](53),
+						},
+					},
+				},
+			},
+		},
+		[]gatewayv1.ParentReference{
+			listenerSetParentRef,
 		},
 	)
 
@@ -310,7 +362,7 @@ func TestBuildUDPRoute(t *testing.T) {
 				RouteType:  RouteTypeUDP,
 				Valid:      false,
 				Attachable: false,
-				ParentRefs: []ParentRef{parentRefGraph},
+				ParentRefs: []ParentRef{gatewayParentRefGraph},
 				Conditions: []conditions.Condition{
 					conditions.NewRouteBackendRefUnsupportedValue("Must have at least one Rule"),
 				},
@@ -328,7 +380,7 @@ func TestBuildUDPRoute(t *testing.T) {
 				RouteType:  RouteTypeUDP,
 				Valid:      true,
 				Attachable: true,
-				ParentRefs: []ParentRef{parentRefGraph},
+				ParentRefs: []ParentRef{gatewayParentRefGraph},
 				Spec: L4RouteSpec{
 					BackendRefs: []BackendRef{
 						{
@@ -360,7 +412,7 @@ func TestBuildUDPRoute(t *testing.T) {
 				RouteType:  RouteTypeUDP,
 				Valid:      true,
 				Attachable: true,
-				ParentRefs: []ParentRef{parentRefGraph},
+				ParentRefs: []ParentRef{gatewayParentRefGraph},
 				Spec: L4RouteSpec{
 					BackendRefs: []BackendRef{
 						{
@@ -390,7 +442,7 @@ func TestBuildUDPRoute(t *testing.T) {
 				RouteType:  RouteTypeUDP,
 				Valid:      true,
 				Attachable: true,
-				ParentRefs: []ParentRef{parentRefGraph},
+				ParentRefs: []ParentRef{gatewayParentRefGraph},
 				Spec: L4RouteSpec{
 					BackendRefs: []BackendRef{
 						{
@@ -423,7 +475,7 @@ func TestBuildUDPRoute(t *testing.T) {
 				RouteType:  RouteTypeUDP,
 				Valid:      true,
 				Attachable: true,
-				ParentRefs: []ParentRef{parentRefGraph},
+				ParentRefs: []ParentRef{gatewayParentRefGraph},
 				Spec: L4RouteSpec{
 					BackendRefs: []BackendRef{
 						{
@@ -454,7 +506,7 @@ func TestBuildUDPRoute(t *testing.T) {
 				RouteType:  RouteTypeUDP,
 				Valid:      true,
 				Attachable: true,
-				ParentRefs: []ParentRef{parentRefGraph},
+				ParentRefs: []ParentRef{gatewayParentRefGraph},
 				Spec: L4RouteSpec{
 					BackendRefs: []BackendRef{
 						{
@@ -484,7 +536,7 @@ func TestBuildUDPRoute(t *testing.T) {
 				RouteType:  RouteTypeUDP,
 				Valid:      true,
 				Attachable: true,
-				ParentRefs: []ParentRef{parentRefGraph},
+				ParentRefs: []ParentRef{gatewayParentRefGraph},
 				Spec: L4RouteSpec{
 					BackendRefs: []BackendRef{
 						{
@@ -515,7 +567,7 @@ func TestBuildUDPRoute(t *testing.T) {
 				RouteType:  RouteTypeUDP,
 				Valid:      true,
 				Attachable: true,
-				ParentRefs: []ParentRef{parentRefGraph},
+				ParentRefs: []ParentRef{gatewayParentRefGraph},
 				Spec: L4RouteSpec{
 					BackendRefs: []BackendRef{
 						{
@@ -555,12 +607,42 @@ func TestBuildUDPRoute(t *testing.T) {
 				RouteType:  RouteTypeUDP,
 				Valid:      true,
 				Attachable: true,
-				ParentRefs: []ParentRef{parentRefGraph},
+				ParentRefs: []ParentRef{gatewayParentRefGraph},
 				Conditions: []conditions.Condition{
 					conditions.NewRouteAcceptedUnsupportedField(
 						"spec.rules[1..1]: Only the first rule is processed. 1 additional rule(s) are ignored",
 					),
 				},
+				Spec: L4RouteSpec{
+					BackendRefs: []BackendRef{
+						{
+							SvcNsName: types.NamespacedName{Namespace: "test", Name: "svc1"},
+							ServicePort: apiv1.ServicePort{
+								Port: 53,
+							},
+							Weight:             1,
+							Valid:              true,
+							InvalidForGateways: make(map[types.NamespacedName]conditions.Condition),
+						},
+					},
+				},
+			},
+		},
+		{
+			name:  "valid single backend with ListenerSet parent ref",
+			route: validUDPRWithListenerSetParentRef,
+			gateways: map[types.NamespacedName]*Gateway{
+				{Namespace: "test", Name: "gateway"}: createGateway(),
+			},
+			services: map[types.NamespacedName]*apiv1.Service{
+				{Namespace: "test", Name: "svc1"}: createSvc("svc1"),
+			},
+			expected: &L4Route{
+				Source:     validUDPRWithListenerSetParentRef,
+				RouteType:  RouteTypeUDP,
+				Valid:      true,
+				Attachable: true,
+				ParentRefs: []ParentRef{listenerSetParentRefGraph},
 				Spec: L4RouteSpec{
 					BackendRefs: []BackendRef{
 						{
@@ -587,7 +669,7 @@ func TestBuildUDPRoute(t *testing.T) {
 			t.Parallel()
 			g := NewWithT(t)
 
-			result := buildUDPRoute(test.route, test.gateways, test.services, refGrantResolver)
+			result := buildUDPRoute(test.route, test.gateways, test.services, refGrantResolver, listenerSets)
 			g.Expect(helpers.Diff(test.expected, result)).To(BeEmpty())
 		})
 	}

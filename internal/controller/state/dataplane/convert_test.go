@@ -918,13 +918,13 @@ func TestConvertAuthenticationFilter(t *testing.T) {
 				},
 			},
 			expected: &AuthenticationFilter{
-				OIDC: &OIDCProvider{
+				OIDC: &AuthOIDC{Provider: &OIDCProvider{
 					Name:         "test_oidc-af",
 					Issuer:       "https://idp.example.com",
 					ClientID:     "client-id",
 					ClientSecret: "my-client-secret",
 					RedirectURI:  "/oidc_callback_test_oidc-af",
-				},
+				}},
 			},
 		},
 		{
@@ -954,13 +954,13 @@ func TestConvertAuthenticationFilter(t *testing.T) {
 				},
 			},
 			expected: &AuthenticationFilter{
-				OIDC: &OIDCProvider{
+				OIDC: &AuthOIDC{Provider: &OIDCProvider{
 					Name:         "test_oidc-af",
 					Issuer:       "https://idp.example.com",
 					ClientID:     "client-id",
 					ClientSecret: "my-client-secret",
 					RedirectURI:  "/custom/callback",
-				},
+				}},
 			},
 		},
 		{
@@ -998,7 +998,7 @@ func TestConvertAuthenticationFilter(t *testing.T) {
 				},
 			},
 			expected: &AuthenticationFilter{
-				OIDC: &OIDCProvider{
+				OIDC: &AuthOIDC{Provider: &OIDCProvider{
 					Name:           "test_oidc-af",
 					Issuer:         "https://idp.example.com",
 					ClientID:       "client-id",
@@ -1006,7 +1006,7 @@ func TestConvertAuthenticationFilter(t *testing.T) {
 					CACertBundleID: generateCertBundleID(types.NamespacedName{Namespace: "test", Name: "oidc-ca"}),
 					CACertData:     []byte("ca-cert-pem"),
 					RedirectURI:    "/oidc_callback_test_oidc-af",
-				},
+				}},
 			},
 		},
 		{
@@ -1103,7 +1103,7 @@ func TestConvertAuthenticationFilter(t *testing.T) {
 				},
 			},
 			expected: &AuthenticationFilter{
-				OIDC: &OIDCProvider{
+				OIDC: &AuthOIDC{Provider: &OIDCProvider{
 					Name:         "test_oidc-af",
 					Issuer:       "https://idp.example.com",
 					ClientID:     "client-id",
@@ -1111,7 +1111,7 @@ func TestConvertAuthenticationFilter(t *testing.T) {
 					RedirectURI:  "/oidc_callback_test_oidc-af",
 					CRLBundleID:  generateCRLBundleID(types.NamespacedName{Namespace: "test", Name: "oidc-crl"}),
 					CRLData:      []byte("crl-pem-data"),
-				},
+				}},
 			},
 		},
 		{
@@ -1141,13 +1141,13 @@ func TestConvertAuthenticationFilter(t *testing.T) {
 				},
 			},
 			expected: &AuthenticationFilter{
-				OIDC: &OIDCProvider{
+				OIDC: &AuthOIDC{Provider: &OIDCProvider{
 					Name:         "test_oidc-af",
 					Issuer:       "https://idp.example.com",
 					ClientID:     "client-id",
 					ClientSecret: "my-client-secret",
 					RedirectURI:  "/oidc_callback_test_oidc-af",
-				},
+				}},
 			},
 		},
 		{
@@ -1190,7 +1190,7 @@ func TestConvertAuthenticationFilter(t *testing.T) {
 				},
 			},
 			expected: &AuthenticationFilter{
-				OIDC: &OIDCProvider{
+				OIDC: &AuthOIDC{Provider: &OIDCProvider{
 					Name:                  "test_oidc-af",
 					Issuer:                "https://idp.example.com",
 					ClientID:              "client-id",
@@ -1205,7 +1205,7 @@ func TestConvertAuthenticationFilter(t *testing.T) {
 					TokenHint:             helpers.GetPointer(true),
 					PKCE:                  helpers.GetPointer(true),
 					ConfigURL:             helpers.GetPointer("https://idp.example.com/.well-known/openid-configuration"),
-				},
+				}},
 			},
 		},
 		{
@@ -1238,13 +1238,160 @@ func TestConvertAuthenticationFilter(t *testing.T) {
 				},
 			},
 			expected: &AuthenticationFilter{
-				OIDC: &OIDCProvider{
+				OIDC: &AuthOIDC{Provider: &OIDCProvider{
 					Name:          "test_oidc-af",
 					Issuer:        "https://idp.example.com",
 					ClientID:      "client-id",
 					ClientSecret:  "my-client-secret",
 					RedirectURI:   "https://auth.example.com/callback",
 					PostLogoutURI: helpers.GetPointer("https://example.com/logged-out"),
+				}},
+			},
+		},
+		{
+			name: "oidc with authorization populates authz fields",
+			filter: &graph.AuthenticationFilter{
+				Source: &ngfAPIv1alpha1.AuthenticationFilter{
+					ObjectMeta: metav1.ObjectMeta{Namespace: "test", Name: "oidc-af"},
+					Spec: ngfAPIv1alpha1.AuthenticationFilterSpec{
+						Type: ngfAPIv1alpha1.AuthTypeOIDC,
+						OIDC: &ngfAPIv1alpha1.OIDCAuth{
+							Issuer:          "https://idp.example.com",
+							ClientID:        "client-id",
+							ClientSecretRef: ngfAPIv1alpha1.LocalObjectReference{Name: "oidc-secret"},
+							Authorization: &ngfAPIv1alpha1.Authorization{
+								Rules: []ngfAPIv1alpha1.Rule{
+									{
+										Claims: []ngfAPIv1alpha1.Claim{
+											{
+												Name:           "email",
+												Values:         []string{"admin@example.com"},
+												Match:          ngfAPIv1alpha1.ClaimMatchTypeExact,
+												ProxySetHeader: helpers.GetPointer("X-OIDC-Email"),
+											},
+										},
+									},
+								},
+							},
+						},
+					},
+				},
+				Valid:      true,
+				Referenced: true,
+			},
+			referencedSecrets: map[types.NamespacedName]*secrets.Secret{
+				{Namespace: "test", Name: "oidc-secret"}: {
+					Source: &apiv1.Secret{
+						ObjectMeta: metav1.ObjectMeta{Namespace: "test", Name: "oidc-secret"},
+						Data:       map[string][]byte{secrets.ClientSecretKey: []byte("my-client-secret")},
+					},
+				},
+			},
+			expected: func() *AuthenticationFilter {
+				authZConfig := buildAuthZConfigFromAuthZSpec("test_oidc_af", &ngfAPIv1alpha1.Authorization{
+					Rules: []ngfAPIv1alpha1.Rule{
+						{
+							Claims: []ngfAPIv1alpha1.Claim{
+								{
+									Name:           "email",
+									Values:         []string{"admin@example.com"},
+									Match:          ngfAPIv1alpha1.ClaimMatchTypeExact,
+									ProxySetHeader: helpers.GetPointer("X-OIDC-Email"),
+								},
+							},
+						},
+					},
+				})
+				return &AuthenticationFilter{
+					OIDC: &AuthOIDC{
+						Provider: &OIDCProvider{
+							Name:         "test_oidc-af",
+							Issuer:       "https://idp.example.com",
+							ClientID:     "client-id",
+							ClientSecret: "my-client-secret",
+							RedirectURI:  "/oidc_callback_test_oidc-af",
+						},
+						AuthRequireVariable:  authZConfig.RequireVariable,
+						AuthZProxySetHeaders: authZConfig.ProxySetHeaders,
+					},
+				}
+			}(),
+		},
+		{
+			name: "oidc with authorization but empty rules does not populate authz fields",
+			filter: &graph.AuthenticationFilter{
+				Source: &ngfAPIv1alpha1.AuthenticationFilter{
+					ObjectMeta: metav1.ObjectMeta{Namespace: "test", Name: "oidc-af"},
+					Spec: ngfAPIv1alpha1.AuthenticationFilterSpec{
+						Type: ngfAPIv1alpha1.AuthTypeOIDC,
+						OIDC: &ngfAPIv1alpha1.OIDCAuth{
+							Issuer:          "https://idp.example.com",
+							ClientID:        "client-id",
+							ClientSecretRef: ngfAPIv1alpha1.LocalObjectReference{Name: "oidc-secret"},
+							Authorization: &ngfAPIv1alpha1.Authorization{
+								Rules: []ngfAPIv1alpha1.Rule{},
+							},
+						},
+					},
+				},
+				Valid:      true,
+				Referenced: true,
+			},
+			referencedSecrets: map[types.NamespacedName]*secrets.Secret{
+				{Namespace: "test", Name: "oidc-secret"}: {
+					Source: &apiv1.Secret{
+						ObjectMeta: metav1.ObjectMeta{Namespace: "test", Name: "oidc-secret"},
+						Data:       map[string][]byte{secrets.ClientSecretKey: []byte("my-client-secret")},
+					},
+				},
+			},
+			expected: &AuthenticationFilter{
+				OIDC: &AuthOIDC{
+					Provider: &OIDCProvider{
+						Name:         "test_oidc-af",
+						Issuer:       "https://idp.example.com",
+						ClientID:     "client-id",
+						ClientSecret: "my-client-secret",
+						RedirectURI:  "/oidc_callback_test_oidc-af",
+					},
+				},
+			},
+		},
+		{
+			name: "oidc with nil authorization does not populate authz fields",
+			filter: &graph.AuthenticationFilter{
+				Source: &ngfAPIv1alpha1.AuthenticationFilter{
+					ObjectMeta: metav1.ObjectMeta{Namespace: "test", Name: "oidc-af"},
+					Spec: ngfAPIv1alpha1.AuthenticationFilterSpec{
+						Type: ngfAPIv1alpha1.AuthTypeOIDC,
+						OIDC: &ngfAPIv1alpha1.OIDCAuth{
+							Issuer:          "https://idp.example.com",
+							ClientID:        "client-id",
+							ClientSecretRef: ngfAPIv1alpha1.LocalObjectReference{Name: "oidc-secret"},
+							Authorization:   nil,
+						},
+					},
+				},
+				Valid:      true,
+				Referenced: true,
+			},
+			referencedSecrets: map[types.NamespacedName]*secrets.Secret{
+				{Namespace: "test", Name: "oidc-secret"}: {
+					Source: &apiv1.Secret{
+						ObjectMeta: metav1.ObjectMeta{Namespace: "test", Name: "oidc-secret"},
+						Data:       map[string][]byte{secrets.ClientSecretKey: []byte("my-client-secret")},
+					},
+				},
+			},
+			expected: &AuthenticationFilter{
+				OIDC: &AuthOIDC{
+					Provider: &OIDCProvider{
+						Name:         "test_oidc-af",
+						Issuer:       "https://idp.example.com",
+						ClientID:     "client-id",
+						ClientSecret: "my-client-secret",
+						RedirectURI:  "/oidc_callback_test_oidc-af",
+					},
 				},
 			},
 		},
@@ -1392,8 +1539,247 @@ func TestConvertAuthenticationFilter(t *testing.T) {
 				},
 			},
 		},
+		{
+			name: "jwt auth file-based with authorization populates authz fields",
+			filter: &graph.AuthenticationFilter{
+				Source: &ngfAPIv1alpha1.AuthenticationFilter{
+					ObjectMeta: metav1.ObjectMeta{
+						Name:      "af",
+						Namespace: "test",
+					},
+					Spec: ngfAPIv1alpha1.AuthenticationFilterSpec{
+						Type: ngfAPIv1alpha1.AuthTypeJWT,
+						JWT: &ngfAPIv1alpha1.JWTAuth{
+							Realm:  "my-realm",
+							Source: ngfAPIv1alpha1.JWTKeySourceFile,
+							File: &ngfAPIv1alpha1.JWTFileKeySource{
+								SecretRef: ngfAPIv1alpha1.LocalObjectReference{Name: "jwt-secret"},
+							},
+							KeyCache: helpers.GetPointer(ngfAPIv1alpha1.Duration("60s")),
+							Leeway:   helpers.GetPointer(ngfAPIv1alpha1.Duration("30s")),
+							Authorization: &ngfAPIv1alpha1.Authorization{
+								Rules: []ngfAPIv1alpha1.Rule{
+									{
+										Claims: []ngfAPIv1alpha1.Claim{
+											{
+												Name:   "aud",
+												Values: []string{"my-api"},
+												Match:  ngfAPIv1alpha1.ClaimMatchTypeExact,
+											},
+										},
+									},
+								},
+							},
+						},
+					},
+				},
+				Valid:      true,
+				Referenced: true,
+			},
+			referencedSecrets: map[types.NamespacedName]*secrets.Secret{
+				{Namespace: "test", Name: "jwt-secret"}: {
+					Source: &apiv1.Secret{
+						ObjectMeta: metav1.ObjectMeta{Namespace: "test", Name: "jwt-secret"},
+						Data: map[string][]byte{
+							secrets.AuthKey: []byte("token"),
+						},
+					},
+				},
+			},
+			expected: func() *AuthenticationFilter {
+				authZConfig := buildAuthZConfigFromAuthZSpec("test_af", &ngfAPIv1alpha1.Authorization{
+					Rules: []ngfAPIv1alpha1.Rule{
+						{
+							Claims: []ngfAPIv1alpha1.Claim{
+								{
+									Name:   "aud",
+									Values: []string{"my-api"},
+									Match:  ngfAPIv1alpha1.ClaimMatchTypeExact,
+								},
+							},
+						},
+					},
+				})
+				return &AuthenticationFilter{
+					JWT: &AuthJWT{
+						SecretName:           "jwt-secret",
+						SecretNamespace:      "test",
+						Realm:                "my-realm",
+						KeyCache:             helpers.GetPointer(ngfAPIv1alpha1.Duration("60s")),
+						Data:                 []byte("token"),
+						Leeway:               helpers.GetPointer(ngfAPIv1alpha1.Duration("30s")),
+						AuthRequireVariable:  authZConfig.RequireVariable,
+						AuthZProxySetHeaders: authZConfig.ProxySetHeaders,
+					},
+				}
+			}(),
+		},
+		{
+			name: "jwt auth remote with authorization populates authz fields",
+			filter: &graph.AuthenticationFilter{
+				Source: &ngfAPIv1alpha1.AuthenticationFilter{
+					ObjectMeta: metav1.ObjectMeta{
+						Name:      "af",
+						Namespace: "test",
+					},
+					Spec: ngfAPIv1alpha1.AuthenticationFilterSpec{
+						Type: ngfAPIv1alpha1.AuthTypeJWT,
+						JWT: &ngfAPIv1alpha1.JWTAuth{
+							Realm:  "my-realm",
+							Source: ngfAPIv1alpha1.JWTKeySourceRemote,
+							Remote: &ngfAPIv1alpha1.JWTRemoteKeySource{
+								URI: "https://idp.example.com/jwks",
+							},
+							KeyCache: helpers.GetPointer(ngfAPIv1alpha1.Duration("1h")),
+							Leeway:   helpers.GetPointer(ngfAPIv1alpha1.Duration("10s")),
+							Authorization: &ngfAPIv1alpha1.Authorization{
+								Rules: []ngfAPIv1alpha1.Rule{
+									{
+										Claims: []ngfAPIv1alpha1.Claim{
+											{
+												Name:           "roles",
+												Values:         []string{"admin"},
+												Match:          ngfAPIv1alpha1.ClaimMatchTypeExact,
+												ProxySetHeader: helpers.GetPointer("X-User-Role"),
+											},
+										},
+									},
+								},
+							},
+						},
+					},
+				},
+				Valid:      true,
+				Referenced: true,
+			},
+			referencedSecrets: nil,
+			expected: func() *AuthenticationFilter {
+				authZConfig := buildAuthZConfigFromAuthZSpec("test_af", &ngfAPIv1alpha1.Authorization{
+					Rules: []ngfAPIv1alpha1.Rule{
+						{
+							Claims: []ngfAPIv1alpha1.Claim{
+								{
+									Name:           "roles",
+									Values:         []string{"admin"},
+									Match:          ngfAPIv1alpha1.ClaimMatchTypeExact,
+									ProxySetHeader: helpers.GetPointer("X-User-Role"),
+								},
+							},
+						},
+					},
+				})
+				return &AuthenticationFilter{
+					JWT: &AuthJWT{
+						Realm:    "my-realm",
+						KeyCache: helpers.GetPointer(ngfAPIv1alpha1.Duration("1h")),
+						Remote: &AuthJWTRemote{
+							URI:  "https://idp.example.com/jwks",
+							Path: "/_ngf-internal-test_af_jwks_uri",
+						},
+						Leeway:               helpers.GetPointer(ngfAPIv1alpha1.Duration("10s")),
+						AuthRequireVariable:  authZConfig.RequireVariable,
+						AuthZProxySetHeaders: authZConfig.ProxySetHeaders,
+					},
+				}
+			}(),
+		},
+		{
+			name: "jwt auth with authorization but empty rules does not populate authz fields",
+			filter: &graph.AuthenticationFilter{
+				Source: &ngfAPIv1alpha1.AuthenticationFilter{
+					ObjectMeta: metav1.ObjectMeta{
+						Name:      "af",
+						Namespace: "test",
+					},
+					Spec: ngfAPIv1alpha1.AuthenticationFilterSpec{
+						Type: ngfAPIv1alpha1.AuthTypeJWT,
+						JWT: &ngfAPIv1alpha1.JWTAuth{
+							Realm:  "my-realm",
+							Source: ngfAPIv1alpha1.JWTKeySourceFile,
+							File: &ngfAPIv1alpha1.JWTFileKeySource{
+								SecretRef: ngfAPIv1alpha1.LocalObjectReference{Name: "jwt-secret"},
+							},
+							KeyCache: helpers.GetPointer(ngfAPIv1alpha1.Duration("60s")),
+							Leeway:   helpers.GetPointer(ngfAPIv1alpha1.Duration("30s")),
+							Authorization: &ngfAPIv1alpha1.Authorization{
+								Rules: []ngfAPIv1alpha1.Rule{},
+							},
+						},
+					},
+				},
+				Valid:      true,
+				Referenced: true,
+			},
+			referencedSecrets: map[types.NamespacedName]*secrets.Secret{
+				{Namespace: "test", Name: "jwt-secret"}: {
+					Source: &apiv1.Secret{
+						ObjectMeta: metav1.ObjectMeta{Namespace: "test", Name: "jwt-secret"},
+						Data: map[string][]byte{
+							secrets.AuthKey: []byte("token"),
+						},
+					},
+				},
+			},
+			expected: &AuthenticationFilter{
+				JWT: &AuthJWT{
+					SecretName:      "jwt-secret",
+					SecretNamespace: "test",
+					Realm:           "my-realm",
+					KeyCache:        helpers.GetPointer(ngfAPIv1alpha1.Duration("60s")),
+					Data:            []byte("token"),
+					// Leeway should still be set even if Authorization rules are empty.
+					Leeway: helpers.GetPointer(ngfAPIv1alpha1.Duration("30s")),
+				},
+			},
+		},
+		{
+			name: "jwt auth with nil authorization does not populate authz fields",
+			filter: &graph.AuthenticationFilter{
+				Source: &ngfAPIv1alpha1.AuthenticationFilter{
+					ObjectMeta: metav1.ObjectMeta{
+						Name:      "af",
+						Namespace: "test",
+					},
+					Spec: ngfAPIv1alpha1.AuthenticationFilterSpec{
+						Type: ngfAPIv1alpha1.AuthTypeJWT,
+						JWT: &ngfAPIv1alpha1.JWTAuth{
+							Realm:  "my-realm",
+							Source: ngfAPIv1alpha1.JWTKeySourceFile,
+							File: &ngfAPIv1alpha1.JWTFileKeySource{
+								SecretRef: ngfAPIv1alpha1.LocalObjectReference{Name: "jwt-secret"},
+							},
+							KeyCache:      helpers.GetPointer(ngfAPIv1alpha1.Duration("60s")),
+							Leeway:        helpers.GetPointer(ngfAPIv1alpha1.Duration("30s")),
+							Authorization: nil,
+						},
+					},
+				},
+				Valid:      true,
+				Referenced: true,
+			},
+			referencedSecrets: map[types.NamespacedName]*secrets.Secret{
+				{Namespace: "test", Name: "jwt-secret"}: {
+					Source: &apiv1.Secret{
+						ObjectMeta: metav1.ObjectMeta{Namespace: "test", Name: "jwt-secret"},
+						Data: map[string][]byte{
+							secrets.AuthKey: []byte("token"),
+						},
+					},
+				},
+			},
+			expected: &AuthenticationFilter{
+				JWT: &AuthJWT{
+					SecretName:      "jwt-secret",
+					SecretNamespace: "test",
+					Realm:           "my-realm",
+					KeyCache:        helpers.GetPointer(ngfAPIv1alpha1.Duration("60s")),
+					Data:            []byte("token"),
+					// Leeway should still be set even if Authorization is nil
+					Leeway: helpers.GetPointer(ngfAPIv1alpha1.Duration("30s")),
+				},
+			},
+		},
 	}
-
 	for _, tc := range tests {
 		t.Run(tc.name, func(t *testing.T) {
 			t.Parallel()
@@ -1513,6 +1899,219 @@ func TestConvertHTTPCORSFilter(t *testing.T) {
 			g := NewWithT(t)
 
 			result := convertHTTPCORSFilter(test.filter)
+			g.Expect(result).To(Equal(test.expected))
+		})
+	}
+}
+
+func TestConvertHTTPExternalAuthFilter(t *testing.T) {
+	t.Parallel()
+
+	port := v1.PortNumber(80)
+	gwNsName := types.NamespacedName{Namespace: "gw-ns", Name: "gw"}
+	routeNsName := types.NamespacedName{Namespace: "default", Name: "coffee-route"}
+
+	validBackendRef := graph.BackendRef{
+		SvcNsName:   types.NamespacedName{Namespace: "default", Name: "ext-auth-server"},
+		ServicePort: apiv1.ServicePort{Port: 80},
+		Valid:       true,
+	}
+
+	backendRefWithBTP := graph.BackendRef{
+		SvcNsName:   types.NamespacedName{Namespace: "default", Name: "ext-auth-server"},
+		ServicePort: apiv1.ServicePort{Port: 80},
+		Valid:       true,
+		BackendTLSPolicy: &graph.BackendTLSPolicy{
+			Source: &v1.BackendTLSPolicy{
+				Spec: v1.BackendTLSPolicySpec{
+					Validation: v1.BackendTLSPolicyValidation{
+						Hostname: "ext-auth-server.default.svc.cluster.local",
+					},
+				},
+			},
+			Valid:    true,
+			Gateways: []types.NamespacedName{gwNsName},
+		},
+	}
+
+	tests := []struct {
+		filter     *v1.HTTPExternalAuthFilter
+		expected   *HTTPExternalAuthFilter
+		name       string
+		backendRef graph.BackendRef
+	}{
+		{
+			name:       "nil filter returns nil",
+			filter:     nil,
+			backendRef: validBackendRef,
+			expected:   nil,
+		},
+		{
+			name: "basic HTTP external auth filter with no httpAuthConfig or forwardBody",
+			filter: &v1.HTTPExternalAuthFilter{
+				ExternalAuthProtocol: v1.HTTPRouteExternalAuthHTTPProtocol,
+				BackendRef: v1.BackendObjectReference{
+					Name: "ext-auth-server",
+					Port: &port,
+				},
+			},
+			backendRef: validBackendRef,
+			expected: &HTTPExternalAuthFilter{
+				UpstreamName: "default_ext-auth-server_80",
+				InternalPath: "/_ngf-internal-ext-auth-default_coffee-route_rule0",
+			},
+		},
+		{
+			name: "HTTP external auth filter with httpAuthConfig populated",
+			filter: &v1.HTTPExternalAuthFilter{
+				ExternalAuthProtocol: v1.HTTPRouteExternalAuthHTTPProtocol,
+				BackendRef: v1.BackendObjectReference{
+					Name: "ext-auth-server",
+					Port: &port,
+				},
+				HTTPAuthConfig: &v1.HTTPAuthConfig{
+					Path:                   "/auth/check",
+					AllowedRequestHeaders:  []string{"X-Api-Key"},
+					AllowedResponseHeaders: []string{"X-User-Id"},
+				},
+			},
+			backendRef: validBackendRef,
+			expected: &HTTPExternalAuthFilter{
+				UpstreamName:           "default_ext-auth-server_80",
+				InternalPath:           "/_ngf-internal-ext-auth-default_coffee-route_rule0",
+				PathPrefix:             "/auth/check",
+				AllowedRequestHeaders:  []string{"X-Api-Key"},
+				AllowedResponseHeaders: []string{"X-User-Id"},
+			},
+		},
+		{
+			name: "HTTP external auth filter with forwardBody",
+			filter: &v1.HTTPExternalAuthFilter{
+				ExternalAuthProtocol: v1.HTTPRouteExternalAuthHTTPProtocol,
+				BackendRef: v1.BackendObjectReference{
+					Name: "ext-auth-server",
+					Port: &port,
+				},
+				ForwardBody: &v1.ForwardBodyConfig{
+					MaxSize: 1024,
+				},
+			},
+			backendRef: validBackendRef,
+			expected: &HTTPExternalAuthFilter{
+				UpstreamName: "default_ext-auth-server_80",
+				InternalPath: "/_ngf-internal-ext-auth-default_coffee-route_rule0",
+				ForwardBody:  true,
+				MaxBodySize:  1024,
+			},
+		},
+		{
+			name: "forwardBody with maxSize zero does not enable body forwarding",
+			filter: &v1.HTTPExternalAuthFilter{
+				ExternalAuthProtocol: v1.HTTPRouteExternalAuthHTTPProtocol,
+				BackendRef: v1.BackendObjectReference{
+					Name: "ext-auth-server",
+					Port: &port,
+				},
+				ForwardBody: &v1.ForwardBodyConfig{
+					MaxSize: 0,
+				},
+			},
+			backendRef: validBackendRef,
+			expected: &HTTPExternalAuthFilter{
+				UpstreamName: "default_ext-auth-server_80",
+				InternalPath: "/_ngf-internal-ext-auth-default_coffee-route_rule0",
+			},
+		},
+		{
+			name: "HTTP external auth filter with BackendTLSPolicy populates VerifyTLS",
+			filter: &v1.HTTPExternalAuthFilter{
+				ExternalAuthProtocol: v1.HTTPRouteExternalAuthHTTPProtocol,
+				BackendRef: v1.BackendObjectReference{
+					Name: "ext-auth-server",
+					Port: &port,
+				},
+			},
+			backendRef: backendRefWithBTP,
+			expected: &HTTPExternalAuthFilter{
+				UpstreamName: "default_ext-auth-server_80",
+				InternalPath: "/_ngf-internal-ext-auth-default_coffee-route_rule0",
+				VerifyTLS: &VerifyTLS{
+					Hostname:   "ext-auth-server.default.svc.cluster.local",
+					RootCAPath: AlpineSSLRootCAPath,
+				},
+			},
+		},
+	}
+
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			t.Parallel()
+			g := NewWithT(t)
+
+			result := convertHTTPExternalAuthFilter(test.filter, test.backendRef, routeNsName, 0, gwNsName)
+			g.Expect(result).To(Equal(test.expected))
+		})
+	}
+}
+
+func TestConvertWAFBundles(t *testing.T) {
+	t.Parallel()
+
+	tests := []struct {
+		input    map[graph.WAFBundleKey]*graph.WAFBundleData
+		expected map[WAFBundleID]WAFBundle
+		name     string
+	}{
+		{
+			name:     "empty input",
+			input:    map[graph.WAFBundleKey]*graph.WAFBundleData{},
+			expected: map[WAFBundleID]WAFBundle{},
+		},
+		{
+			name: "single bundle with data",
+			input: map[graph.WAFBundleKey]*graph.WAFBundleData{
+				"bundle1.tgz": {
+					Data: []byte("bundle data"),
+				},
+			},
+			expected: map[WAFBundleID]WAFBundle{
+				"bundle1.tgz": WAFBundle([]byte("bundle data")),
+			},
+		},
+		{
+			name: "single bundle with nil data",
+			input: map[graph.WAFBundleKey]*graph.WAFBundleData{
+				"bundle2.tgz": nil,
+			},
+			expected: map[WAFBundleID]WAFBundle{
+				"bundle2.tgz": WAFBundle(nil),
+			},
+		},
+		{
+			name: "multiple bundles with mixed data",
+			input: map[graph.WAFBundleKey]*graph.WAFBundleData{
+				"bundle1.tgz": {
+					Data: []byte("first bundle"),
+				},
+				"bundle2.tgz": nil,
+				"bundle3.tgz": {
+					Data: []byte("third bundle"),
+				},
+			},
+			expected: map[WAFBundleID]WAFBundle{
+				"bundle1.tgz": WAFBundle([]byte("first bundle")),
+				"bundle2.tgz": WAFBundle(nil),
+				"bundle3.tgz": WAFBundle([]byte("third bundle")),
+			},
+		},
+	}
+
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			t.Parallel()
+			g := NewWithT(t)
+
+			result := convertWAFBundles(test.input)
 			g.Expect(result).To(Equal(test.expected))
 		})
 	}

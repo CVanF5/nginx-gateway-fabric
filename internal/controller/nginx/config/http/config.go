@@ -62,12 +62,16 @@ type Location struct {
 	Return *Return
 	// ProxySSLVerify controls SSL verification for upstreams when proxying requests.
 	ProxySSLVerify *ProxySSLVerify
-	// ProxyPass is the upstream backend (URL or name) to which requests are proxied.
-	ProxyPass string
-	// CORSHeaders are the CORS headers to be added for this location.
-	CORSHeaders []Header
-	// HTTPMatchKey is the key for associating HTTP match rules, used for routing and NJS module logic.
-	HTTPMatchKey string
+	// AuthExternalRequest holds external auth (auth_request) configuration.
+	AuthExternalRequest *AuthExternalRequest
+	// AuthJWT contains the configuration for JWT authentication.
+	AuthJWT *AuthJWT
+	// AuthBasic contains the configuration for basic authentication.
+	AuthBasic *AuthBasic
+	// ProxyPassRequestBody renders proxy_pass_request_body ("on"/"off"); unset leaves the directive out.
+	ProxyPassRequestBody string
+	// ProxyPassRequestHeaders renders proxy_pass_request_headers ("on"/"off"); unset leaves the directive out.
+	ProxyPassRequestHeaders string
 	// MirrorSplitClientsVariableName is the variable name for split_clients, used in traffic mirroring scenarios.
 	MirrorSplitClientsVariableName string
 	// EPPInternalPath is the internal path for the inference NJS module to redirect to.
@@ -78,12 +82,15 @@ type Location struct {
 	Type LocationType
 	// Path is the NGINX location path.
 	Path string
-	// AuthBasic contains the configuration for basic authentication.
-	AuthBasic *AuthBasic
-	// AuthJWT contains the configuration for JWT authentication.
-	AuthJWT *AuthJWT
-	// AuthOIDCProviderName is the name of the oidc_provider to be referenced in this location.
-	AuthOIDCProviderName string
+	// HTTPMatchKey is the key for associating HTTP match rules, used for routing and NJS module logic.
+	HTTPMatchKey string
+	// ProxyPass is the upstream backend (URL or name) to which requests are proxied.
+	ProxyPass string
+	// ProxyHTTPVersion is the HTTP protocol version for proxying (e.g. "1.1" or "2").
+	// When empty, NGINX defaults to "1.1".
+	ProxyHTTPVersion string
+	// AuthOIDC holds the OIDC authentication configuration for this location.
+	AuthOIDC *AuthOIDC
 	// ResponseHeaders are custom response headers to be sent.
 	ResponseHeaders ResponseHeaders
 	// ProxySetHeaders are headers to set when proxying requests upstream.
@@ -94,10 +101,41 @@ type Location struct {
 	MirrorPaths []string
 	// Includes are additional NGINX config snippets or policies to include in this location.
 	Includes []shared.Include
+	// CORSHeaders are the CORS headers to be added for this location.
+	CORSHeaders []Header
 	// EPPPort is the port for the EndpointPicker, used for inference routing.
 	EPPPort int
+	// ClientMaxBodySize renders client_max_body_size in bytes; unset leaves the directive out.
+	ClientMaxBodySize uint16
 	// GRPC indicates if this location proxies gRPC traffic.
 	GRPC bool
+}
+
+// AuthOIDC holds the OIDC authentication configuration for a location.
+type AuthOIDC struct {
+	// AuthZConfig holds the authorization configuration for OIDC.
+	// When set, the `auth_jwt` directive is enabled to process JWT claims.
+	AuthZConfig *AuthZConfig
+	// ProviderName is the name of the oidc_provider to be referenced in this location.
+	ProviderName string
+}
+
+// AuthExternalRequest holds the auth_request configuration for a location.
+type AuthExternalRequest struct {
+	// ProxySSLVerify holds TLS verification config for the auth backend.
+	ProxySSLVerify *ProxySSLVerify
+	// InternalPath is the auth subrequest location path.
+	InternalPath string
+	// UpstreamName is the upstream to proxy_pass to in the internal location.
+	UpstreamName string
+	// PathPrefix is an optional path prefix forwarded to the auth server.
+	PathPrefix string
+	// AllowedRequestHeaders are extra headers to proxy_set_header to the auth server.
+	AllowedRequestHeaders []string
+	// AllowedResponseHeaders are headers to copy from auth response via auth_request_set.
+	AllowedResponseHeaders []string
+	// ForwardBody, if true, enables proxy_pass_request_body in the internal location.
+	ForwardBody bool
 }
 
 // Header defines an HTTP header to be passed to the proxied server.
@@ -151,8 +189,8 @@ type Upstream struct {
 	Name                string
 	ZoneSize            string // format: 512k, 1m
 	StateFile           string
-	LoadBalancingMethod string
 	HashMethodKey       string
+	LoadBalancingMethod string
 	KeepAlive           UpstreamKeepAlive
 	Servers             []UpstreamServer
 }
@@ -207,10 +245,18 @@ type AuthBasic struct {
 // AuthJWT holds the configuration for JWT authentication using the auth_jwt directive.
 // See https://nginx.org/en/docs/http/ngx_http_auth_jwt_module.html
 type AuthJWT struct {
-	KeyCache *ngfAPI.Duration
-	Remote   *AuthJWTRemote
-	Realm    string
-	File     string
+	KeyCache    *ngfAPI.Duration
+	Remote      *AuthJWTRemote
+	Leeway      *ngfAPI.Duration
+	AuthZConfig *AuthZConfig
+	Realm       string
+	File        string
+}
+
+// ProxySetHeaderClaim maps a claim variable to a proxy_set_header name.
+type ProxySetHeaderClaim struct {
+	HeaderName    string
+	ClaimVariable string
 }
 
 // AuthJWTRemote holds configuration for remote JWKS retrieval.
@@ -218,6 +264,15 @@ type AuthJWTRemote struct {
 	TrustedCertificate string
 	URI                string
 	Path               string
+}
+
+// AuthZConfig is the authorization configuration for JWT and OIDC authentication.
+// This includes the auth_jwt_require variable and claim-based proxy_set_header directives.
+type AuthZConfig struct {
+	// AuthRequire is the variable name for the auth_jwt_require directive.
+	AuthRequire string
+	// ProxySetHeaders are claim-based proxy_set_header directives.
+	ProxySetHeaders []Header
 }
 
 // ServerConfig holds configuration for an HTTP server and IP family to be used by NGINX.
@@ -231,14 +286,18 @@ type ServerConfig struct {
 
 var (
 	OSSAllowedLBMethods = map[ngfAPI.LoadBalancingType]struct{}{
-		ngfAPI.LoadBalancingTypeRoundRobin:               {},
-		ngfAPI.LoadBalancingTypeLeastConnection:          {},
-		ngfAPI.LoadBalancingTypeIPHash:                   {},
-		ngfAPI.LoadBalancingTypeRandom:                   {},
-		ngfAPI.LoadBalancingTypeHash:                     {},
-		ngfAPI.LoadBalancingTypeHashConsistent:           {},
-		ngfAPI.LoadBalancingTypeRandomTwo:                {},
-		ngfAPI.LoadBalancingTypeRandomTwoLeastConnection: {},
+		ngfAPI.LoadBalancingTypeRoundRobin:                {},
+		ngfAPI.LoadBalancingTypeLeastConnection:           {},
+		ngfAPI.LoadBalancingTypeIPHash:                    {},
+		ngfAPI.LoadBalancingTypeRandom:                    {},
+		ngfAPI.LoadBalancingTypeHash:                      {},
+		ngfAPI.LoadBalancingTypeHashConsistent:            {},
+		ngfAPI.LoadBalancingTypeRandomTwo:                 {},
+		ngfAPI.LoadBalancingTypeRandomTwoLeastConnection:  {},
+		ngfAPI.LoadBalancingTypeLeastTimeHeader:           {},
+		ngfAPI.LoadBalancingTypeLeastTimeLastByte:         {},
+		ngfAPI.LoadBalancingTypeLeastTimeHeaderInflight:   {},
+		ngfAPI.LoadBalancingTypeLeastTimeLastByteInflight: {},
 	}
 
 	PlusAllowedLBMethods = map[ngfAPI.LoadBalancingType]struct{}{

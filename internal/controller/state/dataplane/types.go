@@ -9,6 +9,7 @@ import (
 
 	ngfAPIv1alpha1 "github.com/nginx/nginx-gateway-fabric/v2/apis/v1alpha1"
 	"github.com/nginx/nginx-gateway-fabric/v2/internal/controller/nginx/config/policies"
+	"github.com/nginx/nginx-gateway-fabric/v2/internal/controller/nginx/config/shared"
 	"github.com/nginx/nginx-gateway-fabric/v2/internal/controller/state/graph"
 	"github.com/nginx/nginx-gateway-fabric/v2/internal/controller/state/resolver"
 )
@@ -44,6 +45,8 @@ type Configuration struct {
 	DeploymentContext DeploymentContext
 	// Logging defines logging related settings for NGINX.
 	Logging Logging
+	// WAF defines the WAF configuration.
+	WAF WAFConfig
 	// BackendGroups holds all unique BackendGroups.
 	BackendGroups []BackendGroup
 	// TCPServers holds all TCPServers
@@ -62,8 +65,8 @@ type Configuration struct {
 	Policies []policies.Policy
 	// UDPServers holds all UDPServers
 	UDPServers []Layer4VirtualServer
-	// TLSPassthroughServers hold all TLSPassthroughServers
-	TLSPassthroughServers []Layer4VirtualServer
+	// TLSServers holds all TLS servers (both Passthrough and Terminate mode).
+	TLSServers []Layer4VirtualServer
 	// SSLListenerHostnames maps each HTTPS port to its list of raw listener hostnames.
 	// An empty string represents a listener with no hostname (catch-all).
 	// Used to build NGINX maps for misdirected request detection.
@@ -96,6 +99,13 @@ type CertBundle []byte
 
 // AuthFileData is the data for a basic auth user file.
 type AuthFileData []byte
+
+// WAFBundleID is a unique identifier for a WAF bundle.
+// The ID is safe to use as a file name.
+type WAFBundleID string
+
+// WAFBundle is a WAF bundle.
+type WAFBundle []byte
 
 // SSLKeyPair is an SSL private/public key pair.
 type SSLKeyPair struct {
@@ -131,6 +141,11 @@ type Layer4Upstream struct {
 
 // Layer4VirtualServer is a virtual server for Layer 4 traffic.
 type Layer4VirtualServer struct {
+	// SSL holds the SSL configuration for TLS Terminate mode.
+	// When nil, the server operates in passthrough mode.
+	SSL *SSL
+	// VerifyTLS holds the backend TLS verification config for TLS terminate upstream proxying.
+	VerifyTLS *VerifyTLS
 	// Hostname is the hostname of the server.
 	Hostname string
 	// Upstreams holds upstreams with weights. For single backend cases, the list contains one entry.
@@ -235,25 +250,25 @@ type InvalidHTTPFilter struct{}
 
 // HTTPFilters hold the filters for a MatchRule.
 type HTTPFilters struct {
-	// InvalidFilter is a special filter that indicates whether the filters are invalid. If this is the case,
-	// the data plane must return 500 error, and all other filters are nil.
+	// InvalidFilter is a special filter for handling the case when configured filters are invalid.
 	InvalidFilter *InvalidHTTPFilter
-	// RequestRedirect holds the HTTPRequestRedirectFilter.
+	// RequestRedirect holds an HTTP request redirect filter.
 	RequestRedirect *HTTPRequestRedirectFilter
-	// RequestURLRewrite holds the HTTPURLRewriteFilter.
+	// RequestURLRewrite holds an HTTP URL rewrite filter.
 	RequestURLRewrite *HTTPURLRewriteFilter
-	// RequestHeaderModifiers holds the HTTPHeaderFilter.
+	// RequestHeaderModifiers holds an HTTP header modifier filter for requests.
 	RequestHeaderModifiers *HTTPHeaderFilter
-	// ResponseHeaderModifiers holds the HTTPHeaderFilter.
+	// ResponseHeaderModifiers holds an HTTP header modifier filter for responses.
 	ResponseHeaderModifiers *HTTPHeaderFilter
-	// AuthenticationFilter holds the AuthenticationFilter for the MatchRule.
+	// AuthenticationFilter holds the authentication filter configuration.
 	AuthenticationFilter *AuthenticationFilter
-	// CORSFilter holds the HTTPCORSFilter for the MatchRule.
+	// CORSFilter holds the CORS filter configuration.
 	CORSFilter *HTTPCORSFilter
-	// RequestMirrors holds the HTTPRequestMirrorFilters. There could be more than one specified.
+	// ExternalAuthFilter holds external auth filter configuration.
+	ExternalAuthFilter *HTTPExternalAuthFilter
+	// RequestMirrors holds HTTP request mirror filters.
 	RequestMirrors []*HTTPRequestMirrorFilter
-	// SnippetsFilters holds all the SnippetsFilters for the MatchRule.
-	// Unlike the core and extended filters, there can be more than one SnippetsFilters defined on a routing rule.
+	// SnippetsFilters holds snippets filter configurations.
 	SnippetsFilters []SnippetsFilter
 }
 
@@ -290,13 +305,36 @@ type HTTPCORSFilter struct {
 	MaxAge int32
 }
 
+// HTTPExternalAuthFilter represents configuration for external authorization filter.
+type HTTPExternalAuthFilter struct {
+	// VerifyTLS holds TLS verification config when the auth backend has a BackendTLSPolicy.
+	VerifyTLS *VerifyTLS
+	// UpstreamName is the NGINX upstream name for the auth backend service.
+	UpstreamName string
+	// InternalPath is the NGINX internal location path for the auth subrequest.
+	InternalPath string
+	// PathPrefix is an optional path prefix added to the request path when forwarding to the auth server.
+	PathPrefix string
+	// AllowedRequestHeaders are extra headers to forward from the client request to the auth server,
+	// beyond the mandatory set (Host, Method, Path, Content-Length, Authorization).
+	AllowedRequestHeaders []string
+	// AllowedResponseHeaders are headers from the auth response to copy into the proxied backend request.
+	AllowedResponseHeaders []string
+	// ForwardBody indicates whether the client request body should be forwarded to the auth server.
+	ForwardBody bool
+	// MaxBodySize sets the maximum size of the request body that the client is allowed to send.
+	// It is only applicable when ForwardBody is true. Requests with body larger than the specified size
+	// will be rejected with 413 Payload Too Large error.
+	MaxBodySize uint16
+}
+
 // AuthenticationFilter holds the top level spec for each kind of authentication (e.g. Basic, JWT, etc...).
 type AuthenticationFilter struct {
 	// Basic contains fields related to basic authentication.
 	Basic *AuthBasic
 
 	// OIDC contains fields related to OIDC authentication.
-	OIDC *OIDCProvider
+	OIDC *AuthOIDC
 
 	// JWT contains fields related to JWT authentication.
 	JWT *AuthJWT
@@ -357,6 +395,17 @@ type OIDCProvider struct {
 	CACertData []byte
 }
 
+// AuthOIDC holds the OIDC authentication configuration, combining the provider
+// configuration with optional claim-based authorization.
+type AuthOIDC struct {
+	// Provider holds the OIDC provider configuration (maps to the oidc_provider directive).
+	Provider *OIDCProvider
+	// AuthRequireVariable is the variable name used by auth_jwt_require for OIDC claim validation.
+	AuthRequireVariable string
+	// AuthZProxySetHeaders are claim-based proxy_set_header directives from authorization config.
+	AuthZProxySetHeaders []HTTPHeader
+}
+
 const (
 	oidcCallBack = "/oidc_callback"
 )
@@ -374,6 +423,49 @@ type AuthJWT struct {
 	Realm string
 	// Data contains the JWT public key data required for authentication.
 	Data []byte
+	// Leeway specifies the allowable clock skew between the nbf and exp claims.
+	Leeway *ngfAPIv1alpha1.Duration
+	// AuthRequireVariable is the variable name used by auth_jwt_require.
+	AuthRequireVariable string
+	// AuthZProxySetHeaders are claim-based proxy_set_header directives from authorization config.
+	AuthZProxySetHeaders []HTTPHeader
+}
+
+// AuthZConfig holds the complete authorization configuration for JWT claims.
+type AuthZConfig struct {
+	// FilterNsName is the namespaced name of the AuthenticationFilter this config belongs to.
+	FilterNsName string
+	// AuthClaimSets are the auth_jwt_claim_set directives keyed by variable name.
+	AuthClaimSets map[string][]string
+	// RuleMaps are the per-rule maps (http context).
+	RuleMaps []AuthZRuleMap
+	// AuthZMap is the final aggregation map (http context).
+	AuthZMap *AuthZMap
+	// RequireVariable is the variable name used in auth_jwt_require (location context).
+	RequireVariable string
+	// ProxySetHeaders are claim-based proxy_set_header directives (location context).
+	ProxySetHeaders []HTTPHeader
+}
+
+// AuthZRuleMap represents one or more NGINX maps for a single rule.
+type AuthZRuleMap struct {
+	Require ngfAPIv1alpha1.RequireType
+	Maps    []shared.Map
+}
+
+// AuthZMap is the final map combining all rule results.
+type AuthZMap struct {
+	Require ngfAPIv1alpha1.RequireType
+	shared.Map
+}
+
+// ProxySetHeaderClaim maps a claim variable to a proxy_set_header name.
+// Example:
+//
+//	proxy_set_header X-User-Role $claim_roles;
+type ProxySetHeaderClaim struct {
+	HeaderName    string
+	ClaimVariable string
 }
 
 // AuthJWTRemote holds configuration for remote JWKS retrieval.
@@ -551,6 +643,15 @@ type Backend struct {
 	// Note: The upstream address is also set to this hostname (see resolveUpstreamEndpoints).
 	// Both the Host header and upstream address use the same external hostname to ensure consistency.
 	ExternalHostname string
+	// AppProtocol is the appProtocol of the backing Service port (e.g., "kubernetes.io/h2c").
+	// When set to "kubernetes.io/h2c", NGF will emit proxy_http_version 2 for the corresponding NGINX location.
+	//
+	// Because proxy_http_version is a location-level directive (not per-upstream), NGF applies
+	// an all-or-nothing rule: proxy_http_version 2 is only emitted when every valid backend in
+	// the BackendGroup carries "kubernetes.io/h2c". If even one valid backend does not, NGF falls back
+	// to the NGINX default (1.1) so that all possible upstream targets in a split_clients or
+	// inference-endpoint variable remain reachable.
+	AppProtocol string
 	// Weight is the weight of the BackendRef.
 	// The possible values of weight are 0-1,000,000.
 	// If weight is 0, no traffic should be forwarded for this entry.
@@ -604,6 +705,12 @@ type SpanAttribute struct {
 type BaseHTTPConfig struct {
 	// DNSResolver defines the DNS resolver configuration for NGINX.
 	DNSResolver *DNSResolverConfig
+	// Compression defines the compression settings for NGINX.
+	Compression *CompressionSettings
+	// AuthZConfigs holds the complete authorization configuration for JWT claims.
+	AuthZConfigs []*AuthZConfig
+	// DisableBaseProxySetHeaders specifies which default proxy_set_header entries should be omitted.
+	DisableBaseProxySetHeaders []string
 	// IPFamily specifies the IP family for all servers.
 	IPFamily IPFamilyType
 	// GatewaySecretID is the ID of the secret that contains the gateway backend TLS certificate.
@@ -654,6 +761,28 @@ type DNSResolverConfig struct {
 	DisableIPv6 bool
 }
 
+// CompressionSettings defines the compression configuration for NGINX.
+type CompressionSettings struct {
+	// MinLength is the minimum response length to compress.
+	MinLength *int32
+	// BufferSize is the size of each compression buffer.
+	BufferSize string
+	// HTTPVersion is the minimum HTTP version required for compression.
+	HTTPVersion string
+	// MimeTypes specifies the MIME types to compress.
+	MimeTypes []string
+	// Proxied specifies the proxied request conditions for compression.
+	Proxied []string
+	// Disable specifies User-Agent regex patterns to disable compression.
+	Disable []string
+	// Level is the compression level (1-9).
+	Level int32
+	// BufferNumber is the number of compression buffers.
+	BufferNumber int32
+	// Vary enables the "Vary: Accept-Encoding" response header.
+	Vary bool
+}
+
 // RewriteIPModeType specifies the mode for rewriting the client IP.
 type RewriteIPModeType string
 
@@ -691,6 +820,9 @@ type Logging struct {
 	AccessLog *AccessLog
 	// ErrorLevel defines the error log level.
 	ErrorLevel string
+	// ErrorLogFormat defines the error log format.
+	// If not specified, the default NGINX error log format is used.
+	ErrorLogFormat string
 }
 
 // NginxPlus specifies NGINX Plus additional settings.
@@ -726,4 +858,16 @@ var serverTokensKeywords = map[string]struct{}{
 	graph.ServerTokenBuild: {},
 	graph.ServerTokenOff:   {},
 	graph.ServerTokenOn:    {},
+}
+
+// WAFConfig holds the WAF configuration for the dataplane.
+// It is used to determine whether WAF is enabled and to load the WAF module, as well as storing the WAFBundles.
+type WAFConfig struct {
+	// WAFBundles are the WAF Policy Bundles to be stored in the app_protect bundles directory.
+	WAFBundles map[WAFBundleID]WAFBundle
+	// CookieSeed is a stable value used as the app_protect_cookie_seed directive, ensuring WAF session
+	// cookies are consistent across multiple NGINX replicas.
+	CookieSeed string
+	// Enabled indicates whether WAF is enabled.
+	Enabled bool
 }

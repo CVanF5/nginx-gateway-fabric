@@ -11,12 +11,14 @@ import (
 	"k8s.io/apimachinery/pkg/types"
 	inference "sigs.k8s.io/gateway-api-inference-extension/api/v1"
 
-	"github.com/nginx/nginx-gateway-fabric/v2/apis/v1alpha1"
+	ngfAPIv1alpha1 "github.com/nginx/nginx-gateway-fabric/v2/apis/v1alpha1"
+	"github.com/nginx/nginx-gateway-fabric/v2/apis/v1alpha2"
 	"github.com/nginx/nginx-gateway-fabric/v2/internal/controller/nginx/config/http"
 	"github.com/nginx/nginx-gateway-fabric/v2/internal/controller/nginx/config/policies"
 	"github.com/nginx/nginx-gateway-fabric/v2/internal/controller/nginx/config/policies/policiesfakes"
 	"github.com/nginx/nginx-gateway-fabric/v2/internal/controller/nginx/config/shared"
 	"github.com/nginx/nginx-gateway-fabric/v2/internal/controller/state/dataplane"
+	"github.com/nginx/nginx-gateway-fabric/v2/internal/controller/state/graph"
 	"github.com/nginx/nginx-gateway-fabric/v2/internal/framework/helpers"
 )
 
@@ -169,7 +171,7 @@ func TestExecuteServers(t *testing.T) {
 											SecretName:      "auth-jwt-filter",
 											SecretNamespace: "test-ns",
 											Realm:           "JWT Restricted",
-											KeyCache:        helpers.GetPointer(v1alpha1.Duration("10s")),
+											KeyCache:        helpers.GetPointer(ngfAPIv1alpha1.Duration("10s")),
 											Data:            []byte("token"),
 										},
 									},
@@ -432,7 +434,7 @@ func TestExecuteServers_IPFamily(t *testing.T) {
 			Port: 443,
 		},
 	}
-	passThroughServers := []dataplane.Layer4VirtualServer{
+	tlsServers := []dataplane.Layer4VirtualServer{
 		{
 			IsDefault: true,
 			Hostname:  "*.example.com",
@@ -472,19 +474,19 @@ func TestExecuteServers_IPFamily(t *testing.T) {
 				BaseHTTPConfig: dataplane.BaseHTTPConfig{
 					IPFamily: dataplane.IPv6,
 				},
-				TLSPassthroughServers: passThroughServers,
+				TLSServers: tlsServers,
 			},
 			expectedHTTPConfig: map[string]int{
-				"listen [::]:8080 default_server;":                              1,
-				"listen [::]:8080;":                                             1,
-				"listen [::]:443 ssl default_server;":                           1,
-				"listen [::]:443 ssl;":                                          1,
-				"listen unix:/var/run/nginx/https8443.sock ssl;":                1,
-				"listen unix:/var/run/nginx/https8443.sock ssl default_server;": 1,
-				"server_name example.com;":                                      3,
-				"ssl_certificate /etc/nginx/secrets/test-keypair.pem;":          2,
-				"ssl_certificate_key /etc/nginx/secrets/test-keypair.pem;":      2,
-				"ssl_reject_handshake on;":                                      2,
+				"listen [::]:8080 default_server;":                                         1,
+				"listen [::]:8080;":                                                        1,
+				"listen [::]:443 ssl default_server;":                                      1,
+				"listen [::]:443 ssl;":                                                     1,
+				fmt.Sprintf("listen %shttps8443.sock ssl;", SocketBasePath):                1,
+				fmt.Sprintf("listen %shttps8443.sock ssl default_server;", SocketBasePath): 1,
+				"server_name example.com;":                                                 3,
+				"ssl_certificate /etc/nginx/secrets/test-keypair.pem;":                     2,
+				"ssl_certificate_key /etc/nginx/secrets/test-keypair.pem;":                 2,
+				"ssl_reject_handshake on;":                                                 2,
 			},
 		},
 		{
@@ -1449,7 +1451,7 @@ func TestCreateServers(t *testing.T) {
 				},
 			},
 		},
-		TLSPassthroughServers: []dataplane.Layer4VirtualServer{
+		TLSServers: []dataplane.Layer4VirtualServer{
 			{
 				Hostname: "app.example.com",
 				Port:     8443,
@@ -1517,23 +1519,23 @@ func TestCreateServers(t *testing.T) {
 			Value: "new.example.com",
 		},
 		{
-			Name:  "X-Forwarded-For",
+			Name:  string(v1alpha2.HeaderXForwardedFor),
 			Value: "$proxy_add_x_forwarded_for",
 		},
 		{
-			Name:  "X-Real-IP",
+			Name:  string(v1alpha2.HeaderXRealIP),
 			Value: "$remote_addr",
 		},
 		{
-			Name:  "X-Forwarded-Proto",
+			Name:  string(v1alpha2.HeaderXForwardedProto),
 			Value: "$scheme",
 		},
 		{
-			Name:  "X-Forwarded-Host",
+			Name:  string(v1alpha2.HeaderXForwardedHost),
 			Value: "$host",
 		},
 		{
-			Name:  "X-Forwarded-Port",
+			Name:  string(v1alpha2.HeaderXForwardedPort),
 			Value: "$server_port",
 		},
 		{
@@ -2602,7 +2604,7 @@ func TestCreateLocations_Includes(t *testing.T) {
 		},
 	})
 
-	locations, matches, grpc := createLocations(&httpServer, "1", fakeGenerator, alwaysFalseKeepAliveChecker)
+	locations, matches, grpc := createLocations(&httpServer, "1", fakeGenerator, alwaysFalseKeepAliveChecker, nil)
 
 	g := NewWithT(t)
 	g.Expect(grpc).To(BeFalse())
@@ -2741,11 +2743,11 @@ func TestCreateLocations_InferenceBackends(t *testing.T) {
 
 	proxySetHeaders := []http.Header{
 		{Name: "Host", Value: "$gw_api_compliant_host"},
-		{Name: "X-Forwarded-For", Value: "$proxy_add_x_forwarded_for"},
-		{Name: "X-Real-IP", Value: "$remote_addr"},
-		{Name: "X-Forwarded-Proto", Value: "$scheme"},
-		{Name: "X-Forwarded-Host", Value: "$host"},
-		{Name: "X-Forwarded-Port", Value: "$server_port"},
+		{Name: string(v1alpha2.HeaderXForwardedFor), Value: "$proxy_add_x_forwarded_for"},
+		{Name: string(v1alpha2.HeaderXRealIP), Value: "$remote_addr"},
+		{Name: string(v1alpha2.HeaderXForwardedProto), Value: "$scheme"},
+		{Name: string(v1alpha2.HeaderXForwardedHost), Value: "$host"},
+		{Name: string(v1alpha2.HeaderXForwardedPort), Value: "$server_port"},
 		{Name: "Upgrade", Value: "$http_upgrade"},
 		{Name: "Connection", Value: "$connection_upgrade"},
 	}
@@ -3113,6 +3115,7 @@ func TestCreateLocations_InferenceBackends(t *testing.T) {
 				"1",
 				&policiesfakes.FakeGenerator{},
 				alwaysFalseKeepAliveChecker,
+				nil,
 			)
 
 			g.Expect(helpers.Diff(tc.expLocs, locs)).To(BeEmpty())
@@ -3305,6 +3308,7 @@ func TestCreateLocationsRootPath(t *testing.T) {
 				"1",
 				&policiesfakes.FakeGenerator{},
 				alwaysFalseKeepAliveChecker,
+				nil,
 			)
 			g.Expect(locs).To(Equal(test.expLocations))
 			g.Expect(httpMatchPair).To(BeEmpty())
@@ -3436,6 +3440,7 @@ func TestCreateLocationsPath(t *testing.T) {
 				"1",
 				&policiesfakes.FakeGenerator{},
 				alwaysFalseKeepAliveChecker,
+				nil,
 			)
 			g.Expect(locs).To(Equal(test.expLocations))
 			g.Expect(httpMatchPair).To(BeEmpty())
@@ -4580,7 +4585,7 @@ func TestGenerateProxySetHeaders(t *testing.T) {
 			},
 			expectedHeaders: []http.Header{
 				{
-					Name:  "X-Forwarded-Proto",
+					Name:  string(v1alpha2.HeaderXForwardedProto),
 					Value: "new-proto",
 				},
 				{
@@ -4588,19 +4593,19 @@ func TestGenerateProxySetHeaders(t *testing.T) {
 					Value: "$gw_api_compliant_host",
 				},
 				{
-					Name:  "X-Forwarded-For",
+					Name:  string(v1alpha2.HeaderXForwardedFor),
 					Value: "$proxy_add_x_forwarded_for",
 				},
 				{
-					Name:  "X-Real-IP",
+					Name:  string(v1alpha2.HeaderXRealIP),
 					Value: "$remote_addr",
 				},
 				{
-					Name:  "X-Forwarded-Host",
+					Name:  string(v1alpha2.HeaderXForwardedHost),
 					Value: "$host",
 				},
 				{
-					Name:  "X-Forwarded-Port",
+					Name:  string(v1alpha2.HeaderXForwardedPort),
 					Value: "$server_port",
 				},
 				{
@@ -4639,23 +4644,23 @@ func TestGenerateProxySetHeaders(t *testing.T) {
 					Value: "rewrite-hostname",
 				},
 				{
-					Name:  "X-Forwarded-For",
+					Name:  string(v1alpha2.HeaderXForwardedFor),
 					Value: "$proxy_add_x_forwarded_for",
 				},
 				{
-					Name:  "X-Real-IP",
+					Name:  string(v1alpha2.HeaderXRealIP),
 					Value: "$remote_addr",
 				},
 				{
-					Name:  "X-Forwarded-Proto",
+					Name:  string(v1alpha2.HeaderXForwardedProto),
 					Value: "$scheme",
 				},
 				{
-					Name:  "X-Forwarded-Host",
+					Name:  string(v1alpha2.HeaderXForwardedHost),
 					Value: "$host",
 				},
 				{
-					Name:  "X-Forwarded-Port",
+					Name:  string(v1alpha2.HeaderXForwardedPort),
 					Value: "$server_port",
 				},
 				{
@@ -4726,23 +4731,23 @@ func TestCreateBaseProxySetHeaders(t *testing.T) {
 			Value: "$gw_api_compliant_host",
 		},
 		{
-			Name:  "X-Forwarded-For",
+			Name:  string(v1alpha2.HeaderXForwardedFor),
 			Value: "$proxy_add_x_forwarded_for",
 		},
 		{
-			Name:  "X-Real-IP",
+			Name:  string(v1alpha2.HeaderXRealIP),
 			Value: "$remote_addr",
 		},
 		{
-			Name:  "X-Forwarded-Proto",
+			Name:  string(v1alpha2.HeaderXForwardedProto),
 			Value: "$scheme",
 		},
 		{
-			Name:  "X-Forwarded-Host",
+			Name:  string(v1alpha2.HeaderXForwardedHost),
 			Value: "$host",
 		},
 		{
-			Name:  "X-Forwarded-Port",
+			Name:  string(v1alpha2.HeaderXForwardedPort),
 			Value: "$server_port",
 		},
 	}
@@ -4789,6 +4794,235 @@ func TestCreateBaseProxySetHeaders(t *testing.T) {
 
 			result := createBaseProxySetHeaders("", test.additionalHeaders...)
 			g.Expect(result).To(Equal(test.expBaseHeaders))
+		})
+	}
+}
+
+func TestFilterBaseProxySetHeaders(t *testing.T) {
+	t.Parallel()
+
+	baseHeaders := []http.Header{
+		{Name: "Host", Value: "$gw_api_compliant_host"},
+		{Name: string(v1alpha2.HeaderXForwardedFor), Value: "$proxy_add_x_forwarded_for"},
+		{Name: string(v1alpha2.HeaderXRealIP), Value: "$remote_addr"},
+		{Name: string(v1alpha2.HeaderXForwardedProto), Value: "$scheme"},
+		{Name: string(v1alpha2.HeaderXForwardedHost), Value: "$host"},
+		{Name: string(v1alpha2.HeaderXForwardedPort), Value: "$server_port"},
+		{Name: "Upgrade", Value: "$http_upgrade"},
+	}
+
+	tests := []struct {
+		msg                     string
+		disableBaseProxyHeaders []string
+		expected                []http.Header
+	}{
+		{
+			msg:                     "no headers disabled",
+			disableBaseProxyHeaders: nil,
+			expected:                baseHeaders,
+		},
+		{
+			msg:                     "disable single supported header",
+			disableBaseProxyHeaders: []string{string(v1alpha2.HeaderXForwardedFor)},
+			expected: []http.Header{
+				{Name: "Host", Value: "$gw_api_compliant_host"},
+				{Name: string(v1alpha2.HeaderXRealIP), Value: "$remote_addr"},
+				{Name: string(v1alpha2.HeaderXForwardedProto), Value: "$scheme"},
+				{Name: string(v1alpha2.HeaderXForwardedHost), Value: "$host"},
+				{Name: string(v1alpha2.HeaderXForwardedPort), Value: "$server_port"},
+				{Name: "Upgrade", Value: "$http_upgrade"},
+			},
+		},
+		{
+			msg: "disable multiple supported headers",
+			disableBaseProxyHeaders: []string{
+				string(v1alpha2.HeaderXForwardedProto),
+				string(v1alpha2.HeaderXForwardedPort),
+			},
+			expected: []http.Header{
+				{Name: "Host", Value: "$gw_api_compliant_host"},
+				{Name: string(v1alpha2.HeaderXForwardedFor), Value: "$proxy_add_x_forwarded_for"},
+				{Name: string(v1alpha2.HeaderXRealIP), Value: "$remote_addr"},
+				{Name: string(v1alpha2.HeaderXForwardedHost), Value: "$host"},
+				{Name: "Upgrade", Value: "$http_upgrade"},
+			},
+		},
+		{
+			msg:                     "disable all x-* headers with wildcard",
+			disableBaseProxyHeaders: []string{"*"},
+			expected: []http.Header{
+				{Name: "Host", Value: "$gw_api_compliant_host"},
+				{Name: "Upgrade", Value: "$http_upgrade"},
+			},
+		},
+		{
+			msg:                     "wildcard plus explicit X-* header disables all X-* headers",
+			disableBaseProxyHeaders: []string{"*", string(v1alpha2.HeaderXForwardedProto)},
+			expected: []http.Header{
+				{Name: "Host", Value: "$gw_api_compliant_host"},
+				{Name: "Upgrade", Value: "$http_upgrade"},
+			},
+		},
+		{
+			msg:                     "unknown header in disable list is ignored",
+			disableBaseProxyHeaders: []string{"X-Not-A-Header"},
+			expected:                baseHeaders,
+		},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.msg, func(t *testing.T) {
+			t.Parallel()
+			g := NewWithT(t)
+
+			result := filterBaseProxySetHeaders(baseHeaders, tc.disableBaseProxyHeaders)
+			g.Expect(result).To(Equal(tc.expected))
+		})
+	}
+}
+
+// TestExecuteServers_DisableBaseProxySetHeaders verifies that DisableBaseProxySetHeaders is tested end-to-end
+// through createServers → createServer/createSSLServer → createLocations → updateLocations →
+// updateLocation → updateLocationProxySettings, so that the rendered NGINX config omits the
+// disabled proxy_set_header entries while keeping the rest.
+func TestExecuteServers_DisableBaseProxySetHeaders(t *testing.T) {
+	t.Parallel()
+
+	backend := dataplane.BackendGroup{
+		Source:  types.NamespacedName{Namespace: "test", Name: "route1"},
+		RuleIdx: 0,
+		Backends: []dataplane.Backend{
+			{UpstreamName: "test_foo_80", Valid: true, Weight: 1},
+		},
+	}
+
+	pathRule := dataplane.PathRule{
+		Path:     "/coffee",
+		PathType: dataplane.PathTypePrefix,
+		MatchRules: []dataplane.MatchRule{
+			{
+				Match:        dataplane.Match{},
+				BackendGroup: backend,
+			},
+		},
+	}
+
+	tests := []struct {
+		name                       string
+		disableBaseProxySetHeaders []string
+		expPresent                 []string
+		expAbsent                  []string
+	}{
+		{
+			name:                       "no headers disabled – all base headers rendered",
+			disableBaseProxySetHeaders: nil,
+			expPresent: []string{
+				`proxy_set_header Host "$gw_api_compliant_host";`,
+				`proxy_set_header X-Forwarded-For "$proxy_add_x_forwarded_for";`,
+				`proxy_set_header X-Real-IP "$remote_addr";`,
+				`proxy_set_header X-Forwarded-Proto "$scheme";`,
+				`proxy_set_header X-Forwarded-Host "$host";`,
+				`proxy_set_header X-Forwarded-Port "$server_port";`,
+			},
+			expAbsent: nil,
+		},
+		{
+			name: "disable X-Forwarded-For – omitted from proxy_set_header",
+			disableBaseProxySetHeaders: []string{
+				string(v1alpha2.HeaderXForwardedFor),
+			},
+			expPresent: []string{
+				`proxy_set_header Host "$gw_api_compliant_host";`,
+				`proxy_set_header X-Real-IP "$remote_addr";`,
+				`proxy_set_header X-Forwarded-Proto "$scheme";`,
+				`proxy_set_header X-Forwarded-Host "$host";`,
+				`proxy_set_header X-Forwarded-Port "$server_port";`,
+			},
+			expAbsent: []string{
+				`proxy_set_header X-Forwarded-For`,
+			},
+		},
+		{
+			name: "disable X-Forwarded-For and X-Forwarded-Proto",
+			disableBaseProxySetHeaders: []string{
+				string(v1alpha2.HeaderXForwardedFor),
+				string(v1alpha2.HeaderXForwardedProto),
+			},
+			expPresent: []string{
+				`proxy_set_header Host "$gw_api_compliant_host";`,
+				`proxy_set_header X-Real-IP "$remote_addr";`,
+				`proxy_set_header X-Forwarded-Host "$host";`,
+				`proxy_set_header X-Forwarded-Port "$server_port";`,
+			},
+			expAbsent: []string{
+				`proxy_set_header X-Forwarded-For`,
+				`proxy_set_header X-Forwarded-Proto`,
+			},
+		},
+		{
+			name: "wildcard disables all X-* headers",
+			disableBaseProxySetHeaders: []string{
+				string(v1alpha2.AllXBaseHeaders),
+			},
+			expPresent: []string{
+				`proxy_set_header Host "$gw_api_compliant_host";`,
+			},
+			expAbsent: []string{
+				`proxy_set_header X-Forwarded-For`,
+				`proxy_set_header X-Forwarded-Proto`,
+				`proxy_set_header X-Forwarded-Host`,
+				`proxy_set_header X-Forwarded-Port`,
+				`proxy_set_header X-Real-IP`,
+			},
+		},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+			g := NewWithT(t)
+
+			conf := dataplane.Configuration{
+				HTTPServers: []dataplane.VirtualServer{
+					{
+						Hostname:  "http.example.com",
+						Port:      8080,
+						PathRules: []dataplane.PathRule{pathRule},
+					},
+				},
+				SSLServers: []dataplane.VirtualServer{
+					{
+						Hostname: "ssl.example.com",
+						Port:     8443,
+						SSL: &dataplane.SSL{
+							KeyPairIDs: []dataplane.SSLKeyPairID{"test-keypair"},
+						},
+						PathRules: []dataplane.PathRule{pathRule},
+					},
+				},
+				BaseHTTPConfig: dataplane.BaseHTTPConfig{
+					DisableBaseProxySetHeaders: tc.disableBaseProxySetHeaders,
+				},
+			}
+
+			gen := GeneratorImpl{}
+			results := gen.executeServers(conf, &policiesfakes.FakeGenerator{}, alwaysFalseKeepAliveChecker)
+
+			var serverConf string
+			for _, res := range results {
+				if res.dest == httpConfigFile {
+					serverConf = string(res.data)
+					break
+				}
+			}
+			g.Expect(serverConf).NotTo(BeEmpty())
+
+			for _, s := range tc.expPresent {
+				g.Expect(serverConf).To(ContainSubstring(s), "expected %q to be present", s)
+			}
+			for _, s := range tc.expAbsent {
+				g.Expect(serverConf).NotTo(ContainSubstring(s), "expected %q to be absent", s)
+			}
 		})
 	}
 }
@@ -5273,6 +5507,7 @@ func TestCreateLocations_RegexCatchAllShouldSuppressDefault404(t *testing.T) {
 		"1",
 		&policiesfakes.FakeGenerator{},
 		alwaysFalseKeepAliveChecker,
+		nil,
 	)
 
 	for _, loc := range locs {
@@ -5323,6 +5558,7 @@ func TestCreateLocations_RegexNonRootShouldNotSuppressDefault404(t *testing.T) {
 		"1",
 		&policiesfakes.FakeGenerator{},
 		alwaysFalseKeepAliveChecker,
+		nil,
 	)
 
 	var hasDefault404 bool
@@ -5872,14 +6108,306 @@ func TestUpdateLocationAuthenticationFilter(t *testing.T) {
 		{
 			name: "authentication filter with OIDC",
 			filter: &dataplane.AuthenticationFilter{
-				OIDC: &dataplane.OIDCProvider{
+				OIDC: &dataplane.AuthOIDC{Provider: &dataplane.OIDCProvider{
 					Name: "oidc_test_my-filter",
+				}},
+			},
+			expected: http.Location{
+				Path: "/",
+				Type: http.ExternalLocationType,
+				AuthOIDC: &http.AuthOIDC{
+					ProviderName: "oidc_test_my-filter",
+				},
+			},
+		},
+		{
+			name: "authentication filter with JWT local file",
+			filter: &dataplane.AuthenticationFilter{
+				JWT: &dataplane.AuthJWT{
+					SecretName:      "jwt-secret",
+					SecretNamespace: "test-ns",
+					Realm:           "JWT Realm",
+					KeyCache:        helpers.GetPointer(ngfAPIv1alpha1.Duration("10s")),
 				},
 			},
 			expected: http.Location{
-				Path:                 "/",
-				Type:                 http.ExternalLocationType,
-				AuthOIDCProviderName: "oidc_test_my-filter",
+				Path: "/",
+				Type: http.ExternalLocationType,
+				AuthJWT: &http.AuthJWT{
+					Realm:    "JWT Realm",
+					KeyCache: helpers.GetPointer(ngfAPIv1alpha1.Duration("10s")),
+					File:     "/etc/nginx/secrets/jwt_auth_test-ns_jwt-secret",
+				},
+			},
+		},
+		{
+			name: "authentication filter with JWT remote JWKS",
+			filter: &dataplane.AuthenticationFilter{
+				JWT: &dataplane.AuthJWT{
+					Realm: "Remote Realm",
+					Remote: &dataplane.AuthJWTRemote{
+						URI:              "https://idp.example.com/jwks",
+						Path:             "/_jwks_test_my-filter",
+						CACertBundlePath: "ca_bundle_test_my-ca",
+					},
+				},
+			},
+			expected: http.Location{
+				Path: "/",
+				Type: http.ExternalLocationType,
+				AuthJWT: &http.AuthJWT{
+					Realm: "Remote Realm",
+					Remote: &http.AuthJWTRemote{
+						URI:                "https://idp.example.com/jwks",
+						Path:               "/_jwks_test_my-filter",
+						TrustedCertificate: "/etc/nginx/secrets/ca_bundle_test_my-ca.crt",
+					},
+				},
+			},
+		},
+		{
+			name: "authentication filter with JWT remote JWKS without CA cert uses Alpine default",
+			filter: &dataplane.AuthenticationFilter{
+				JWT: &dataplane.AuthJWT{
+					Realm: "Remote Realm",
+					Remote: &dataplane.AuthJWTRemote{
+						URI:  "https://idp.example.com/jwks",
+						Path: "/_jwks_test_my-filter",
+					},
+				},
+			},
+			expected: http.Location{
+				Path: "/",
+				Type: http.ExternalLocationType,
+				AuthJWT: &http.AuthJWT{
+					Realm: "Remote Realm",
+					Remote: &http.AuthJWTRemote{
+						URI:                "https://idp.example.com/jwks",
+						Path:               "/_jwks_test_my-filter",
+						TrustedCertificate: dataplane.AlpineSSLRootCAPath,
+					},
+				},
+			},
+		},
+		{
+			name: "authentication filter with JWT and AuthRequireVariable",
+			filter: &dataplane.AuthenticationFilter{
+				JWT: &dataplane.AuthJWT{
+					SecretName:          "jwt-secret",
+					SecretNamespace:     "test-ns",
+					Realm:               "AuthZ Realm",
+					AuthRequireVariable: "$test_authz_all",
+				},
+			},
+			expected: http.Location{
+				Path: "/",
+				Type: http.ExternalLocationType,
+				AuthJWT: &http.AuthJWT{
+					Realm: "AuthZ Realm",
+					File:  "/etc/nginx/secrets/jwt_auth_test-ns_jwt-secret",
+					AuthZConfig: &http.AuthZConfig{
+						AuthRequire: "$test_authz_all",
+					},
+				},
+			},
+		},
+		{
+			name: "authentication filter with JWT and AuthZProxySetHeaders",
+			filter: &dataplane.AuthenticationFilter{
+				JWT: &dataplane.AuthJWT{
+					SecretName:      "jwt-secret",
+					SecretNamespace: "test-ns",
+					Realm:           "AuthZ Realm",
+					AuthZProxySetHeaders: []dataplane.HTTPHeader{
+						{Name: "X-User-Role", Value: "$jwt_claim_role"},
+						{Name: "X-User-Sub", Value: "$jwt_claim_sub"},
+					},
+				},
+			},
+			expected: http.Location{
+				Path: "/",
+				Type: http.ExternalLocationType,
+				AuthJWT: &http.AuthJWT{
+					Realm: "AuthZ Realm",
+					File:  "/etc/nginx/secrets/jwt_auth_test-ns_jwt-secret",
+					AuthZConfig: &http.AuthZConfig{
+						ProxySetHeaders: []http.Header{
+							{Name: "X-User-Role", Value: "$jwt_claim_role"},
+							{Name: "X-User-Sub", Value: "$jwt_claim_sub"},
+						},
+					},
+				},
+			},
+		},
+		{
+			name: "authentication filter with JWT AuthRequireVariable and AuthZProxySetHeaders combined",
+			filter: &dataplane.AuthenticationFilter{
+				JWT: &dataplane.AuthJWT{
+					SecretName:          "jwt-secret",
+					SecretNamespace:     "test-ns",
+					Realm:               "Full AuthZ",
+					KeyCache:            helpers.GetPointer(ngfAPIv1alpha1.Duration("5m")),
+					Leeway:              helpers.GetPointer(ngfAPIv1alpha1.Duration("30s")),
+					AuthRequireVariable: "$test_authz_any",
+					AuthZProxySetHeaders: []dataplane.HTTPHeader{
+						{Name: "X-Audience", Value: "$jwt_claim_aud"},
+					},
+				},
+			},
+			expected: http.Location{
+				Path: "/",
+				Type: http.ExternalLocationType,
+				AuthJWT: &http.AuthJWT{
+					Realm:    "Full AuthZ",
+					File:     "/etc/nginx/secrets/jwt_auth_test-ns_jwt-secret",
+					KeyCache: helpers.GetPointer(ngfAPIv1alpha1.Duration("5m")),
+					Leeway:   helpers.GetPointer(ngfAPIv1alpha1.Duration("30s")),
+					AuthZConfig: &http.AuthZConfig{
+						AuthRequire: "$test_authz_any",
+						ProxySetHeaders: []http.Header{
+							{Name: "X-Audience", Value: "$jwt_claim_aud"},
+						},
+					},
+				},
+			},
+		},
+		{
+			name: "authentication filter with JWT empty AuthRequireVariable is not set",
+			filter: &dataplane.AuthenticationFilter{
+				JWT: &dataplane.AuthJWT{
+					SecretName:          "jwt-secret",
+					SecretNamespace:     "test-ns",
+					Realm:               "No Require",
+					AuthRequireVariable: "",
+				},
+			},
+			expected: http.Location{
+				Path: "/",
+				Type: http.ExternalLocationType,
+				AuthJWT: &http.AuthJWT{
+					Realm: "No Require",
+					File:  "/etc/nginx/secrets/jwt_auth_test-ns_jwt-secret",
+				},
+			},
+		},
+		{
+			name: "authentication filter with JWT empty AuthZProxySetHeaders is not set",
+			filter: &dataplane.AuthenticationFilter{
+				JWT: &dataplane.AuthJWT{
+					SecretName:           "jwt-secret",
+					SecretNamespace:      "test-ns",
+					Realm:                "No Headers",
+					AuthZProxySetHeaders: []dataplane.HTTPHeader{},
+				},
+			},
+			expected: http.Location{
+				Path: "/",
+				Type: http.ExternalLocationType,
+				AuthJWT: &http.AuthJWT{
+					Realm: "No Headers",
+					File:  "/etc/nginx/secrets/jwt_auth_test-ns_jwt-secret",
+				},
+			},
+		},
+		{
+			name: "authentication filter with OIDC and AuthRequireVariable",
+			filter: &dataplane.AuthenticationFilter{
+				OIDC: &dataplane.AuthOIDC{
+					Provider:            &dataplane.OIDCProvider{Name: "oidc_test_my-filter"},
+					AuthRequireVariable: "$oidc_authz_all",
+				},
+			},
+			expected: http.Location{
+				Path: "/",
+				Type: http.ExternalLocationType,
+				AuthOIDC: &http.AuthOIDC{
+					ProviderName: "oidc_test_my-filter",
+					AuthZConfig: &http.AuthZConfig{
+						AuthRequire: "$oidc_authz_all",
+					},
+				},
+			},
+		},
+		{
+			name: "authentication filter with OIDC and AuthZProxySetHeaders",
+			filter: &dataplane.AuthenticationFilter{
+				OIDC: &dataplane.AuthOIDC{
+					Provider: &dataplane.OIDCProvider{Name: "oidc_test_my-filter"},
+					AuthZProxySetHeaders: []dataplane.HTTPHeader{
+						{Name: "X-OIDC-Email", Value: "$oidc_claim_email"},
+						{Name: "X-OIDC-Sub", Value: "$oidc_claim_sub"},
+					},
+				},
+			},
+			expected: http.Location{
+				Path: "/",
+				Type: http.ExternalLocationType,
+				AuthOIDC: &http.AuthOIDC{
+					ProviderName: "oidc_test_my-filter",
+					AuthZConfig: &http.AuthZConfig{
+						ProxySetHeaders: []http.Header{
+							{Name: "X-OIDC-Email", Value: "$oidc_claim_email"},
+							{Name: "X-OIDC-Sub", Value: "$oidc_claim_sub"},
+						},
+					},
+				},
+			},
+		},
+		{
+			name: "authentication filter with OIDC AuthRequireVariable and AuthZProxySetHeaders combined",
+			filter: &dataplane.AuthenticationFilter{
+				OIDC: &dataplane.AuthOIDC{
+					Provider:            &dataplane.OIDCProvider{Name: "oidc_test_my-filter"},
+					AuthRequireVariable: "$oidc_authz_any",
+					AuthZProxySetHeaders: []dataplane.HTTPHeader{
+						{Name: "X-OIDC-Role", Value: "$oidc_claim_role"},
+					},
+				},
+			},
+			expected: http.Location{
+				Path: "/",
+				Type: http.ExternalLocationType,
+				AuthOIDC: &http.AuthOIDC{
+					ProviderName: "oidc_test_my-filter",
+					AuthZConfig: &http.AuthZConfig{
+						AuthRequire: "$oidc_authz_any",
+						ProxySetHeaders: []http.Header{
+							{Name: "X-OIDC-Role", Value: "$oidc_claim_role"},
+						},
+					},
+				},
+			},
+		},
+		{
+			name: "authentication filter with OIDC empty AuthRequireVariable and no AuthZProxySetHeaders",
+			filter: &dataplane.AuthenticationFilter{
+				OIDC: &dataplane.AuthOIDC{
+					Provider:            &dataplane.OIDCProvider{Name: "oidc_test_my-filter"},
+					AuthRequireVariable: "",
+				},
+			},
+			expected: http.Location{
+				Path: "/",
+				Type: http.ExternalLocationType,
+				AuthOIDC: &http.AuthOIDC{
+					ProviderName: "oidc_test_my-filter",
+				},
+			},
+		},
+		{
+			name: "authentication filter with OIDC empty AuthZProxySetHeaders is not set",
+			filter: &dataplane.AuthenticationFilter{
+				OIDC: &dataplane.AuthOIDC{
+					Provider:             &dataplane.OIDCProvider{Name: "oidc_test_my-filter"},
+					AuthZProxySetHeaders: []dataplane.HTTPHeader{},
+				},
+			},
+			expected: http.Location{
+				Path: "/",
+				Type: http.ExternalLocationType,
+				AuthOIDC: &http.AuthOIDC{
+					ProviderName: "oidc_test_my-filter",
+				},
 			},
 		},
 	}
@@ -5929,9 +6457,9 @@ func TestExecuteServers_OIDCAuth(t *testing.T) {
 										BackendGroup: backend,
 										Filters: dataplane.HTTPFilters{
 											AuthenticationFilter: &dataplane.AuthenticationFilter{
-												OIDC: &dataplane.OIDCProvider{
+												OIDC: &dataplane.AuthOIDC{Provider: &dataplane.OIDCProvider{
 													Name: "oidc_test_my-filter",
-												},
+												}},
 											},
 										},
 									},
@@ -5942,7 +6470,7 @@ func TestExecuteServers_OIDCAuth(t *testing.T) {
 				},
 			},
 			expPresent: []string{"auth_oidc oidc_test_my-filter;"},
-			expAbsent:  []string{"auth_basic"},
+			expAbsent:  []string{"auth_basic", "auth_jwt"},
 		},
 		{
 			name: "nil AuthenticationFilter results in no auth_oidc in location",
@@ -5966,7 +6494,7 @@ func TestExecuteServers_OIDCAuth(t *testing.T) {
 					},
 				},
 			},
-			expAbsent: []string{"auth_oidc", "auth_basic"},
+			expAbsent: []string{"auth_oidc", "auth_basic", "auth_jwt"},
 		},
 		{
 			name: "Empty authentication filter results in no auth_oidc in location",
@@ -5993,7 +6521,7 @@ func TestExecuteServers_OIDCAuth(t *testing.T) {
 					},
 				},
 			},
-			expAbsent: []string{"auth_oidc"},
+			expAbsent: []string{"auth_oidc", "auth_jwt", "auth_basic"},
 		},
 		{
 			name: "OIDC filter with redirect URI generates a callback location with auth_oidc",
@@ -6012,10 +6540,10 @@ func TestExecuteServers_OIDCAuth(t *testing.T) {
 										BackendGroup: backend,
 										Filters: dataplane.HTTPFilters{
 											AuthenticationFilter: &dataplane.AuthenticationFilter{
-												OIDC: &dataplane.OIDCProvider{
+												OIDC: &dataplane.AuthOIDC{Provider: &dataplane.OIDCProvider{
 													Name:        "oidc_test_my-filter",
 													RedirectURI: "/oidc_callback_test_my-filter",
-												},
+												}},
 											},
 										},
 									},
@@ -6028,6 +6556,97 @@ func TestExecuteServers_OIDCAuth(t *testing.T) {
 			expPresent: []string{
 				"location = /oidc_callback_test_my-filter {",
 				"auth_oidc oidc_test_my-filter;",
+			},
+			expAbsent: []string{
+				"auth_basic",
+				"auth_jwt",
+			},
+		},
+		{
+			name: "OIDC auth with authorization - single rule with one claim",
+			conf: dataplane.Configuration{
+				HTTPServers: []dataplane.VirtualServer{
+					{
+						Hostname: "example.com",
+						Port:     8080,
+						PathRules: []dataplane.PathRule{
+							{
+								Path:     "/protected",
+								PathType: dataplane.PathTypePrefix,
+								MatchRules: []dataplane.MatchRule{
+									{
+										Match:        dataplane.Match{},
+										BackendGroup: backend,
+										Filters: dataplane.HTTPFilters{
+											AuthenticationFilter: &dataplane.AuthenticationFilter{
+												OIDC: &dataplane.AuthOIDC{
+													Provider: &dataplane.OIDCProvider{
+														Name: "oidc_test_my-filter",
+													},
+													AuthRequireVariable: "$oidc_authz_all",
+													AuthZProxySetHeaders: []dataplane.HTTPHeader{
+														{Name: "X-User-Role", Value: "$jwt_claim_role"},
+													},
+												},
+											},
+										},
+									},
+								},
+							},
+						},
+					},
+				},
+			},
+			expPresent: []string{
+				`auth_oidc oidc_test_my-filter;`,
+				`auth_jwt "" token=$oidc_id_token;`,
+				`auth_jwt_require $oidc_authz_all;`,
+				`proxy_set_header X-User-Role $jwt_claim_role;`,
+			},
+			expAbsent: []string{
+				"auth_basic",
+			},
+		},
+		{
+			name: "OIDC auth with authorization - single rule with no proxy set headers",
+			conf: dataplane.Configuration{
+				HTTPServers: []dataplane.VirtualServer{
+					{
+						Hostname: "example.com",
+						Port:     8080,
+						PathRules: []dataplane.PathRule{
+							{
+								Path:     "/protected",
+								PathType: dataplane.PathTypePrefix,
+								MatchRules: []dataplane.MatchRule{
+									{
+										Match:        dataplane.Match{},
+										BackendGroup: backend,
+										Filters: dataplane.HTTPFilters{
+											AuthenticationFilter: &dataplane.AuthenticationFilter{
+												OIDC: &dataplane.AuthOIDC{
+													Provider: &dataplane.OIDCProvider{
+														Name: "oidc_test_my-filter",
+													},
+													AuthRequireVariable: "$oidc_authz_all",
+												},
+											},
+										},
+									},
+								},
+							},
+						},
+					},
+				},
+			},
+			expPresent: []string{
+				`auth_oidc oidc_test_my-filter;`,
+				`auth_jwt "" token=$oidc_id_token;`,
+				`auth_jwt_require $oidc_authz_all;`,
+			},
+			expAbsent: []string{
+				`proxy_set_header X-User-Role`,
+				"auth_basic",
 			},
 		},
 		{
@@ -6047,10 +6666,10 @@ func TestExecuteServers_OIDCAuth(t *testing.T) {
 										BackendGroup: backend,
 										Filters: dataplane.HTTPFilters{
 											AuthenticationFilter: &dataplane.AuthenticationFilter{
-												OIDC: &dataplane.OIDCProvider{
+												OIDC: &dataplane.AuthOIDC{Provider: &dataplane.OIDCProvider{
 													Name:        "oidc_test_filter-one",
 													RedirectURI: "/oidc_callback_test_filter-one",
-												},
+												}},
 											},
 										},
 									},
@@ -6065,10 +6684,10 @@ func TestExecuteServers_OIDCAuth(t *testing.T) {
 										BackendGroup: backend,
 										Filters: dataplane.HTTPFilters{
 											AuthenticationFilter: &dataplane.AuthenticationFilter{
-												OIDC: &dataplane.OIDCProvider{
+												OIDC: &dataplane.AuthOIDC{Provider: &dataplane.OIDCProvider{
 													Name:        "oidc_test_filter-two",
 													RedirectURI: "/oidc_callback_test_filter-two",
-												},
+												}},
 											},
 										},
 									},
@@ -6113,6 +6732,354 @@ func TestExecuteServers_OIDCAuth(t *testing.T) {
 	}
 }
 
+func TestExecuteServers_JWTAuth(t *testing.T) {
+	t.Parallel()
+
+	backend := dataplane.BackendGroup{
+		Source:  types.NamespacedName{Namespace: "test", Name: "route1"},
+		RuleIdx: 0,
+		Backends: []dataplane.Backend{
+			{UpstreamName: "test_foo_80", Valid: true, Weight: 1},
+		},
+	}
+
+	tests := []struct {
+		name       string
+		expPresent []string
+		expAbsent  []string
+		conf       dataplane.Configuration
+	}{
+		{
+			name: "JWT auth with local key file present in location",
+			conf: dataplane.Configuration{
+				HTTPServers: []dataplane.VirtualServer{
+					{
+						Hostname: "example.com",
+						Port:     8080,
+						PathRules: []dataplane.PathRule{
+							{
+								Path:     "/",
+								PathType: dataplane.PathTypePrefix,
+								MatchRules: []dataplane.MatchRule{
+									{
+										Match:        dataplane.Match{},
+										BackendGroup: backend,
+										Filters: dataplane.HTTPFilters{
+											AuthenticationFilter: &dataplane.AuthenticationFilter{
+												JWT: &dataplane.AuthJWT{
+													SecretName:      "jwt-secret",
+													SecretNamespace: "test-ns",
+													Realm:           "JWT Restricted",
+												},
+											},
+										},
+									},
+								},
+							},
+						},
+					},
+				},
+			},
+			expPresent: []string{
+				`auth_jwt "JWT Restricted";`,
+				"auth_jwt_key_file /etc/nginx/secrets/jwt_auth_test-ns_jwt-secret;",
+			},
+			expAbsent: []string{"auth_basic", "auth_oidc", "auth_jwt_key_request", "auth_jwt_key_cache", "auth_jwt_leeway"},
+		},
+		{
+			name: "JWT auth with key cache and leeway",
+			conf: dataplane.Configuration{
+				HTTPServers: []dataplane.VirtualServer{
+					{
+						Hostname: "example.com",
+						Port:     8080,
+						PathRules: []dataplane.PathRule{
+							{
+								Path:     "/",
+								PathType: dataplane.PathTypePrefix,
+								MatchRules: []dataplane.MatchRule{
+									{
+										Match:        dataplane.Match{},
+										BackendGroup: backend,
+										Filters: dataplane.HTTPFilters{
+											AuthenticationFilter: &dataplane.AuthenticationFilter{
+												JWT: &dataplane.AuthJWT{
+													SecretName:      "jwt-secret",
+													SecretNamespace: "test-ns",
+													Realm:           "JWT Restricted",
+													KeyCache:        helpers.GetPointer(ngfAPIv1alpha1.Duration("10s")),
+													Leeway:          helpers.GetPointer(ngfAPIv1alpha1.Duration("30s")),
+												},
+											},
+										},
+									},
+								},
+							},
+						},
+					},
+				},
+			},
+			expPresent: []string{
+				`auth_jwt "JWT Restricted";`,
+				"auth_jwt_key_file /etc/nginx/secrets/jwt_auth_test-ns_jwt-secret;",
+				"auth_jwt_key_cache 10s;",
+				"auth_jwt_leeway 30s;",
+			},
+			expAbsent: []string{"auth_basic", "auth_oidc", "auth_jwt_key_request"},
+		},
+		{
+			name: "JWT auth with remote JWKS URI",
+			conf: dataplane.Configuration{
+				HTTPServers: []dataplane.VirtualServer{
+					{
+						Hostname: "example.com",
+						Port:     8080,
+						PathRules: []dataplane.PathRule{
+							{
+								Path:     "/",
+								PathType: dataplane.PathTypePrefix,
+								MatchRules: []dataplane.MatchRule{
+									{
+										Match:        dataplane.Match{},
+										BackendGroup: backend,
+										Filters: dataplane.HTTPFilters{
+											AuthenticationFilter: &dataplane.AuthenticationFilter{
+												JWT: &dataplane.AuthJWT{
+													Realm: "Remote JWT",
+													Remote: &dataplane.AuthJWTRemote{
+														URI:  "https://idp.example.com/jwks",
+														Path: "/_jwks_test_my-filter",
+													},
+												},
+											},
+										},
+									},
+								},
+							},
+						},
+					},
+				},
+			},
+			expPresent: []string{
+				`auth_jwt "Remote JWT";`,
+				"auth_jwt_key_request /_jwks_test_my-filter;",
+			},
+			expAbsent: []string{"auth_basic", "auth_oidc", "auth_jwt_key_file"},
+		},
+		{
+			name: "JWT auth with authorization require and proxy set headers",
+			conf: dataplane.Configuration{
+				HTTPServers: []dataplane.VirtualServer{
+					{
+						Hostname: "example.com",
+						Port:     8080,
+						PathRules: []dataplane.PathRule{
+							{
+								Path:     "/protected",
+								PathType: dataplane.PathTypePrefix,
+								MatchRules: []dataplane.MatchRule{
+									{
+										Match:        dataplane.Match{},
+										BackendGroup: backend,
+										Filters: dataplane.HTTPFilters{
+											AuthenticationFilter: &dataplane.AuthenticationFilter{
+												JWT: &dataplane.AuthJWT{
+													SecretName:          "jwt-secret",
+													SecretNamespace:     "test-ns",
+													Realm:               "AuthZ Realm",
+													AuthRequireVariable: "$test_authz_all",
+													AuthZProxySetHeaders: []dataplane.HTTPHeader{
+														{Name: "X-User-Role", Value: "$jwt_claim_role"},
+													},
+												},
+											},
+										},
+									},
+								},
+							},
+						},
+					},
+				},
+			},
+			expPresent: []string{
+				`auth_jwt "AuthZ Realm";`,
+				"auth_jwt_key_file /etc/nginx/secrets/jwt_auth_test-ns_jwt-secret;",
+				"auth_jwt_require $test_authz_all;",
+				"proxy_set_header X-User-Role $jwt_claim_role;",
+			},
+			expAbsent: []string{"auth_basic", "auth_oidc", "auth_jwt_key_request", "auth_jwt_key_cache", "auth_jwt_leeway"},
+		},
+		{
+			name: "nil AuthenticationFilter results in no auth_jwt in location",
+			conf: dataplane.Configuration{
+				HTTPServers: []dataplane.VirtualServer{
+					{
+						Hostname: "example.com",
+						Port:     8080,
+						PathRules: []dataplane.PathRule{
+							{
+								Path:     "/",
+								PathType: dataplane.PathTypePrefix,
+								MatchRules: []dataplane.MatchRule{
+									{
+										Match:        dataplane.Match{},
+										BackendGroup: backend,
+									},
+								},
+							},
+						},
+					},
+				},
+			},
+			expAbsent: []string{"auth_jwt", "auth_basic", "auth_oidc"},
+		},
+		{
+			name: "empty authentication filter results in no auth_jwt in location",
+			conf: dataplane.Configuration{
+				HTTPServers: []dataplane.VirtualServer{
+					{
+						Hostname: "example.com",
+						Port:     8080,
+						PathRules: []dataplane.PathRule{
+							{
+								Path:     "/",
+								PathType: dataplane.PathTypePrefix,
+								MatchRules: []dataplane.MatchRule{
+									{
+										Match:        dataplane.Match{},
+										BackendGroup: backend,
+										Filters: dataplane.HTTPFilters{
+											AuthenticationFilter: &dataplane.AuthenticationFilter{},
+										},
+									},
+								},
+							},
+						},
+					},
+				},
+			},
+			expAbsent: []string{"auth_jwt", "auth_basic", "auth_oidc"},
+		},
+		{
+			name: "JWT auth on SSL server with key cache",
+			conf: dataplane.Configuration{
+				SSLServers: []dataplane.VirtualServer{
+					{
+						Hostname: "secure.example.com",
+						Port:     8443,
+						SSL: &dataplane.SSL{
+							KeyPairIDs: []dataplane.SSLKeyPairID{"test-keypair"},
+						},
+						PathRules: []dataplane.PathRule{
+							{
+								Path:     "/api",
+								PathType: dataplane.PathTypePrefix,
+								MatchRules: []dataplane.MatchRule{
+									{
+										Match:        dataplane.Match{},
+										BackendGroup: backend,
+										Filters: dataplane.HTTPFilters{
+											AuthenticationFilter: &dataplane.AuthenticationFilter{
+												JWT: &dataplane.AuthJWT{
+													SecretName:      "jwt-secret",
+													SecretNamespace: "default",
+													Realm:           "SSL JWT",
+													KeyCache:        helpers.GetPointer(ngfAPIv1alpha1.Duration("5m")),
+												},
+											},
+										},
+									},
+								},
+							},
+						},
+					},
+				},
+			},
+			expPresent: []string{
+				`auth_jwt "SSL JWT";`,
+				"auth_jwt_key_file /etc/nginx/secrets/jwt_auth_default_jwt-secret;",
+				"auth_jwt_key_cache 5m;",
+				"ssl_certificate /etc/nginx/secrets/test-keypair.pem;",
+			},
+			expAbsent: []string{"auth_basic", "auth_oidc", "auth_jwt_key_request"},
+		},
+		{
+			name: "two path rules where one has JWT auth and the other does not",
+			conf: dataplane.Configuration{
+				HTTPServers: []dataplane.VirtualServer{
+					{
+						Hostname: "example.com",
+						Port:     8080,
+						PathRules: []dataplane.PathRule{
+							{
+								Path:     "/protected",
+								PathType: dataplane.PathTypePrefix,
+								MatchRules: []dataplane.MatchRule{
+									{
+										Match:        dataplane.Match{},
+										BackendGroup: backend,
+										Filters: dataplane.HTTPFilters{
+											AuthenticationFilter: &dataplane.AuthenticationFilter{
+												JWT: &dataplane.AuthJWT{
+													SecretName:      "jwt-secret",
+													SecretNamespace: "test-ns",
+													Realm:           "Protected",
+												},
+											},
+										},
+									},
+								},
+							},
+							{
+								Path:     "/public",
+								PathType: dataplane.PathTypePrefix,
+								MatchRules: []dataplane.MatchRule{
+									{
+										Match:        dataplane.Match{},
+										BackendGroup: backend,
+									},
+								},
+							},
+						},
+					},
+				},
+			},
+			expPresent: []string{
+				"location /protected",
+				`auth_jwt "Protected";`,
+				"auth_jwt_key_file /etc/nginx/secrets/jwt_auth_test-ns_jwt-secret;",
+				"location /public",
+			},
+			expAbsent: []string{"auth_basic", "auth_oidc", "auth_jwt_key_request"},
+		},
+	}
+
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			t.Parallel()
+			g := NewWithT(t)
+
+			gen := GeneratorImpl{}
+			results := gen.executeServers(test.conf, &policiesfakes.FakeGenerator{}, alwaysFalseKeepAliveChecker)
+
+			var httpData string
+			for _, res := range results {
+				if res.dest == httpConfigFile {
+					httpData = string(res.data)
+					break
+				}
+			}
+
+			for _, sub := range test.expPresent {
+				g.Expect(httpData).To(ContainSubstring(sub))
+			}
+			for _, absent := range test.expAbsent {
+				g.Expect(httpData).NotTo(ContainSubstring(absent))
+			}
+		})
+	}
+}
+
 func TestOIDCCallbackLocation(t *testing.T) {
 	t.Parallel()
 
@@ -6124,7 +7091,7 @@ func TestOIDCCallbackLocation(t *testing.T) {
 	hrNsName := types.NamespacedName{Namespace: "test", Name: "route1"}
 
 	oidcFilter := &dataplane.AuthenticationFilter{
-		OIDC: &dataplane.OIDCProvider{Name: providerName, RedirectURI: oidcCallbackPath},
+		OIDC: &dataplane.AuthOIDC{Provider: &dataplane.OIDCProvider{Name: providerName, RedirectURI: oidcCallbackPath}},
 	}
 
 	singleBackend := dataplane.BackendGroup{
@@ -6184,6 +7151,7 @@ func TestOIDCCallbackLocation(t *testing.T) {
 			"1",
 			&policiesfakes.FakeGenerator{},
 			alwaysFalseKeepAliveChecker,
+			nil,
 		)
 		for i := range locs {
 			if locs[i].Path == "= "+oidcCallbackPath {
@@ -6209,7 +7177,7 @@ func TestOIDCCallbackLocation(t *testing.T) {
 				cb := createOIDCCallbackLocation(provider, oidcCallbackPath)
 				g.Expect(cb.Path).To(Equal("= " + oidcCallbackPath))
 				g.Expect(cb.Type).To(Equal(http.ExternalLocationType))
-				g.Expect(cb.AuthOIDCProviderName).To(Equal(providerName))
+				g.Expect(cb.AuthOIDC.ProviderName).To(Equal(providerName))
 				g.Expect(cb.ProxyPass).To(BeEmpty())
 				g.Expect(cb.ProxySetHeaders).To(BeNil())
 			},
@@ -6221,7 +7189,7 @@ func TestOIDCCallbackLocation(t *testing.T) {
 				g := NewWithT(t)
 				cb := callbackFrom([]dataplane.PathRule{oidcPathRule(singleBackend, false)})
 				g.Expect(cb).NotTo(BeNil())
-				g.Expect(cb.AuthOIDCProviderName).To(Equal(providerName))
+				g.Expect(cb.AuthOIDC.ProviderName).To(Equal(providerName))
 				g.Expect(cb.Type).To(Equal(http.ExternalLocationType))
 				g.Expect(cb.ProxyPass).To(BeEmpty())
 			},
@@ -6233,7 +7201,7 @@ func TestOIDCCallbackLocation(t *testing.T) {
 				g := NewWithT(t)
 				cb := callbackFrom([]dataplane.PathRule{oidcPathRule(weightedBackend, false)})
 				g.Expect(cb).NotTo(BeNil())
-				g.Expect(cb.AuthOIDCProviderName).To(Equal(providerName))
+				g.Expect(cb.AuthOIDC.ProviderName).To(Equal(providerName))
 				g.Expect(cb.Type).To(Equal(http.ExternalLocationType))
 			},
 		},
@@ -6244,7 +7212,7 @@ func TestOIDCCallbackLocation(t *testing.T) {
 				g := NewWithT(t)
 				cb := callbackFrom([]dataplane.PathRule{oidcPathRule(inferenceBackend, true)})
 				g.Expect(cb).NotTo(BeNil())
-				g.Expect(cb.AuthOIDCProviderName).To(Equal(providerName))
+				g.Expect(cb.AuthOIDC.ProviderName).To(Equal(providerName))
 				g.Expect(cb.Type).To(Equal(http.ExternalLocationType))
 			},
 		},
@@ -6274,10 +7242,10 @@ func TestOIDCCallbackLocation(t *testing.T) {
 
 				coffeeSlashPath := "/coffee/"
 				conflictingFilter := &dataplane.AuthenticationFilter{
-					OIDC: &dataplane.OIDCProvider{
+					OIDC: &dataplane.AuthOIDC{Provider: &dataplane.OIDCProvider{
 						Name:        providerName,
 						RedirectURI: coffeeSlashPath,
-					},
+					}},
 				}
 
 				locs, _, _ := createLocations(
@@ -6300,6 +7268,7 @@ func TestOIDCCallbackLocation(t *testing.T) {
 					"1",
 					&policiesfakes.FakeGenerator{},
 					alwaysFalseKeepAliveChecker,
+					nil,
 				)
 
 				var exactCoffeeSlashLocs []http.Location
@@ -6320,10 +7289,10 @@ func TestOIDCCallbackLocation(t *testing.T) {
 
 				exactCallbackPath := "/my-callback"
 				exactFilter := &dataplane.AuthenticationFilter{
-					OIDC: &dataplane.OIDCProvider{
+					OIDC: &dataplane.AuthOIDC{Provider: &dataplane.OIDCProvider{
 						Name:        providerName,
 						RedirectURI: exactCallbackPath,
-					},
+					}},
 				}
 
 				locs, _, _ := createLocations(
@@ -6346,6 +7315,7 @@ func TestOIDCCallbackLocation(t *testing.T) {
 					"1",
 					&policiesfakes.FakeGenerator{},
 					alwaysFalseKeepAliveChecker,
+					nil,
 				)
 
 				// The exact app route already occupies "= /my-callback", so no separate OIDC callback
@@ -6368,10 +7338,10 @@ func TestOIDCCallbackLocation(t *testing.T) {
 				provider2Name := "oidc_test_other-filter"
 				provider2CallbackPath := "/oidc_callback_test_other-filter"
 				oidcFilter2 := &dataplane.AuthenticationFilter{
-					OIDC: &dataplane.OIDCProvider{
+					OIDC: &dataplane.AuthOIDC{Provider: &dataplane.OIDCProvider{
 						Name:        provider2Name,
 						RedirectURI: provider2CallbackPath,
-					},
+					}},
 				}
 
 				locs, _, _ := createLocations(
@@ -6405,14 +7375,15 @@ func TestOIDCCallbackLocation(t *testing.T) {
 					"1",
 					&policiesfakes.FakeGenerator{},
 					alwaysFalseKeepAliveChecker,
+					nil,
 				)
 
 				var callbackPaths []string
 				var callbackProviders []string
 				for _, loc := range locs {
-					if loc.AuthOIDCProviderName != "" && loc.ProxyPass == "" {
+					if loc.AuthOIDC != nil && loc.AuthOIDC.ProviderName != "" && loc.ProxyPass == "" {
 						callbackPaths = append(callbackPaths, loc.Path)
-						callbackProviders = append(callbackProviders, loc.AuthOIDCProviderName)
+						callbackProviders = append(callbackProviders, loc.AuthOIDC.ProviderName)
 					}
 				}
 
@@ -6457,6 +7428,7 @@ func TestOIDCCallbackLocation(t *testing.T) {
 					"1",
 					&policiesfakes.FakeGenerator{},
 					alwaysFalseKeepAliveChecker,
+					nil,
 				)
 
 				var callbackLocs []http.Location
@@ -6496,8 +7468,8 @@ func TestOIDCURILocations(t *testing.T) {
 		},
 	}
 
-	// buildProvider creates an OIDCProvider with the specified URI field set.
-	buildProvider := func(uriType, uriPath string) *dataplane.OIDCProvider {
+	// buildProvider creates an AuthOIDC with the specified URI field set.
+	buildProvider := func(uriType, uriPath string) *dataplane.AuthOIDC {
 		provider := &dataplane.OIDCProvider{
 			Name:        providerName,
 			RedirectURI: oidcCallbackPath,
@@ -6508,7 +7480,7 @@ func TestOIDCURILocations(t *testing.T) {
 		case "FrontChannelLogoutURI":
 			provider.FrontChannelLogoutURI = &uriPath
 		}
-		return provider
+		return &dataplane.AuthOIDC{Provider: provider}
 	}
 
 	// findOIDCCallbackLocation finds the OIDC callback location by its exact path.
@@ -6529,6 +7501,7 @@ func TestOIDCURILocations(t *testing.T) {
 			"1",
 			&policiesfakes.FakeGenerator{},
 			alwaysFalseKeepAliveChecker,
+			nil,
 		)
 		return locs
 	}
@@ -6564,7 +7537,7 @@ func TestOIDCURILocations(t *testing.T) {
 
 			loc := findOIDCCallbackLocation(locs, uriType.path)
 			g.Expect(loc).NotTo(BeNil(), "expected OIDC callback location for %s", uriType.name)
-			g.Expect(loc.AuthOIDCProviderName).To(Equal(providerName))
+			g.Expect(loc.AuthOIDC.ProviderName).To(Equal(providerName))
 			g.Expect(loc.Type).To(Equal(http.ExternalLocationType))
 		})
 
@@ -6601,12 +7574,12 @@ func TestOIDCURILocations(t *testing.T) {
 		logoutPath := "/logged_out"
 		frontChannelPath := "/frontchannel-logout"
 		filter := &dataplane.AuthenticationFilter{
-			OIDC: &dataplane.OIDCProvider{
+			OIDC: &dataplane.AuthOIDC{Provider: &dataplane.OIDCProvider{
 				Name:                  providerName,
 				RedirectURI:           oidcCallbackPath,
 				LogoutURI:             &logoutPath,
 				FrontChannelLogoutURI: &frontChannelPath,
-			},
+			}},
 		}
 		locs := runCreateLocations([]dataplane.PathRule{
 			{
@@ -6626,12 +7599,12 @@ func TestOIDCURILocations(t *testing.T) {
 		frontChannelLoc := findOIDCCallbackLocation(locs, frontChannelPath)
 
 		g.Expect(logoutLoc).NotTo(BeNil(), "expected LogoutURI location")
-		g.Expect(logoutLoc.AuthOIDCProviderName).To(Equal(providerName))
+		g.Expect(logoutLoc.AuthOIDC.ProviderName).To(Equal(providerName))
 		g.Expect(logoutLoc.Type).To(Equal(http.ExternalLocationType))
 		g.Expect(logoutLoc.ProxyPass).To(BeEmpty())
 
 		g.Expect(frontChannelLoc).NotTo(BeNil(), "expected FrontChannelLogoutURI location")
-		g.Expect(frontChannelLoc.AuthOIDCProviderName).To(Equal(providerName))
+		g.Expect(frontChannelLoc.AuthOIDC.ProviderName).To(Equal(providerName))
 		g.Expect(frontChannelLoc.Type).To(Equal(http.ExternalLocationType))
 		g.Expect(frontChannelLoc.ProxyPass).To(BeEmpty())
 	})
@@ -6646,7 +7619,7 @@ func TestFindOIDCProviders(t *testing.T) {
 	makeRule := func(path string, provider *dataplane.OIDCProvider) dataplane.PathRule {
 		var authFilter *dataplane.AuthenticationFilter
 		if provider != nil {
-			authFilter = &dataplane.AuthenticationFilter{OIDC: provider}
+			authFilter = &dataplane.AuthenticationFilter{OIDC: &dataplane.AuthOIDC{Provider: provider}}
 		}
 		return dataplane.PathRule{
 			Path:     path,
@@ -7011,6 +7984,843 @@ func TestExecuteServers_FrontendTLS(t *testing.T) {
 			}
 			for _, sub := range test.expectedAbsent {
 				g.Expect(httpData).NotTo(ContainSubstring(sub))
+			}
+		})
+	}
+}
+
+//nolint:gosec // Tests with mock SSL/TLS configuration data, not real credentials.
+func TestExecuteServers_CORSOptionsShortCircuitPrecedesRewrite(t *testing.T) {
+	t.Parallel()
+	g := NewWithT(t)
+
+	serverConfig := http.ServerConfig{
+		Servers: []http.Server{
+			{
+				ServerName: "cafe.example.com",
+				Listen:     "8080",
+				Locations: []http.Location{
+					{
+						Path:      "/api/",
+						Type:      http.ExternalLocationType,
+						ProxyPass: "http://test_coffee_80$request_uri",
+						Rewrites:  []string{"^/api(?:/([^?]*))? /$1?$args? break"},
+						CORSHeaders: []http.Header{
+							{Name: "Access-Control-Allow-Origin", Value: "$cors_allowed_origin_server0_path0_match0"},
+							{Name: "Access-Control-Allow-Methods", Value: "GET, POST"},
+						},
+					},
+				},
+			},
+		},
+	}
+
+	rendered := string(helpers.MustExecuteTemplate(serversTemplate, serverConfig))
+
+	optionsIdx := strings.Index(rendered, "if ($request_method = OPTIONS)")
+	rewriteIdx := strings.Index(rendered, "rewrite ^/api")
+
+	g.Expect(optionsIdx).To(BeNumerically(">=", 0))
+	g.Expect(rewriteIdx).To(BeNumerically(">", optionsIdx))
+}
+
+func TestExecuteServers_ExternalAuth(t *testing.T) {
+	t.Parallel()
+
+	backend := dataplane.BackendGroup{
+		Source:  types.NamespacedName{Namespace: "test", Name: "route1"},
+		RuleIdx: 0,
+		Backends: []dataplane.Backend{
+			{UpstreamName: "test_foo_80", Valid: true, Weight: 1},
+		},
+	}
+
+	tests := []struct {
+		name       string
+		expPresent []string
+		expAbsent  []string
+		conf       dataplane.Configuration
+	}{
+		{
+			name: "regular location with external auth emits auth_request and internal location",
+			conf: dataplane.Configuration{
+				HTTPServers: []dataplane.VirtualServer{
+					{
+						Hostname: "example.com",
+						Port:     8080,
+						PathRules: []dataplane.PathRule{
+							{
+								Path:     "/coffee",
+								PathType: dataplane.PathTypePrefix,
+								MatchRules: []dataplane.MatchRule{
+									{
+										Match:        dataplane.Match{},
+										BackendGroup: backend,
+										Filters: dataplane.HTTPFilters{
+											ExternalAuthFilter: &dataplane.HTTPExternalAuthFilter{
+												UpstreamName:           "default_ext-auth_80",
+												InternalPath:           "/_ngf-internal-ext-auth-test_route1_rule0",
+												PathPrefix:             "/check",
+												AllowedRequestHeaders:  []string{"X-Custom-Token"},
+												AllowedResponseHeaders: []string{"X-Auth-Status"},
+											},
+										},
+									},
+								},
+							},
+						},
+					},
+				},
+			},
+			expPresent: []string{
+				"auth_request /_ngf-internal-ext-auth-test_route1_rule0;",
+				`auth_request_set $ext_auth_response_x_auth_status $upstream_http_x_auth_status;`,
+				`proxy_set_header X-Auth-Status $ext_auth_response_x_auth_status;`,
+				"location /_ngf-internal-ext-auth-test_route1_rule0 {",
+				"internal;",
+				"proxy_pass http://default_ext-auth_80/check;",
+				`proxy_set_header Host "$gw_api_compliant_host";`,
+				`proxy_set_header Path "$request_uri";`,
+				`proxy_set_header Method "$request_method";`,
+				`proxy_set_header Authorization "$http_authorization";`,
+				`proxy_set_header X-Custom-Token "$http_x_custom_token";`,
+				"proxy_pass_request_headers off;",
+				"proxy_pass_request_body off;",
+				`proxy_set_header Content-Length "";`,
+			},
+			expAbsent: []string{
+				"client_max_body_size",
+				"proxy_pass_request_body on;",
+			},
+		},
+		{
+			name: "external auth with BTP emits https proxy_pass and ssl directives on internal location",
+			conf: dataplane.Configuration{
+				HTTPServers: []dataplane.VirtualServer{
+					{
+						Hostname: "example.com",
+						Port:     8080,
+						PathRules: []dataplane.PathRule{
+							{
+								Path:     "/coffee",
+								PathType: dataplane.PathTypePrefix,
+								MatchRules: []dataplane.MatchRule{
+									{
+										Match:        dataplane.Match{},
+										BackendGroup: backend,
+										Filters: dataplane.HTTPFilters{
+											ExternalAuthFilter: &dataplane.HTTPExternalAuthFilter{
+												UpstreamName: "default_ext-auth_443",
+												InternalPath: "/_ngf-internal-ext-auth-test_route1_rule0",
+												VerifyTLS: &dataplane.VerifyTLS{
+													Hostname:   "auth.example.com",
+													RootCAPath: "/etc/ssl/certs/ca.crt",
+												},
+											},
+										},
+									},
+								},
+							},
+						},
+					},
+				},
+			},
+			expPresent: []string{
+				"auth_request /_ngf-internal-ext-auth-test_route1_rule0;",
+				"location /_ngf-internal-ext-auth-test_route1_rule0 {",
+				"proxy_pass https://default_ext-auth_443;",
+				"proxy_ssl_server_name on;",
+				"proxy_ssl_verify on;",
+				"proxy_ssl_name auth.example.com;",
+				"proxy_ssl_trusted_certificate /etc/ssl/certs/ca.crt;",
+			},
+		},
+		{
+			name: "external auth with forwardBody emits client_max_body_size and no proxy_pass_request_body directive",
+			conf: dataplane.Configuration{
+				HTTPServers: []dataplane.VirtualServer{
+					{
+						Hostname: "example.com",
+						Port:     8080,
+						PathRules: []dataplane.PathRule{
+							{
+								Path:     "/coffee",
+								PathType: dataplane.PathTypePrefix,
+								MatchRules: []dataplane.MatchRule{
+									{
+										Match:        dataplane.Match{},
+										BackendGroup: backend,
+										Filters: dataplane.HTTPFilters{
+											ExternalAuthFilter: &dataplane.HTTPExternalAuthFilter{
+												UpstreamName: "default_ext-auth_80",
+												InternalPath: "/_ngf-internal-ext-auth-test_route1_rule0",
+												ForwardBody:  true,
+												MaxBodySize:  512,
+											},
+										},
+									},
+								},
+							},
+						},
+					},
+				},
+			},
+			expPresent: []string{
+				"client_max_body_size 512;",
+			},
+			expAbsent: []string{
+				`proxy_set_header Content-Length "";`,
+				"proxy_pass_request_body",
+			},
+		},
+		{
+			name: "external auth coexists with mirror filter on the same location",
+			conf: dataplane.Configuration{
+				HTTPServers: []dataplane.VirtualServer{
+					{
+						Hostname: "example.com",
+						Port:     8080,
+						PathRules: []dataplane.PathRule{
+							{
+								Path:     "/coffee",
+								PathType: dataplane.PathTypePrefix,
+								MatchRules: []dataplane.MatchRule{
+									{
+										Match:        dataplane.Match{},
+										BackendGroup: backend,
+										Filters: dataplane.HTTPFilters{
+											ExternalAuthFilter: &dataplane.HTTPExternalAuthFilter{
+												UpstreamName: "default_ext-auth_80",
+												InternalPath: "/_ngf-internal-ext-auth-test_route1_rule0",
+											},
+											RequestMirrors: []*dataplane.HTTPRequestMirrorFilter{
+												{
+													Name:      helpers.GetPointer("mirror-backend"),
+													Namespace: helpers.GetPointer("test"),
+													Target:    helpers.GetPointer("/_ngf-internal-mirror-test/mirror-backend-test/route1-0"),
+													Percent:   helpers.GetPointer(float64(100)),
+												},
+											},
+										},
+									},
+								},
+							},
+						},
+					},
+				},
+			},
+			expPresent: []string{
+				"auth_request /_ngf-internal-ext-auth-test_route1_rule0;",
+				"mirror /_ngf-internal-mirror-test/mirror-backend-test/route1-0;",
+			},
+		},
+		{
+			name: "nil external auth filter results in no auth_request in location",
+			conf: dataplane.Configuration{
+				HTTPServers: []dataplane.VirtualServer{
+					{
+						Hostname: "example.com",
+						Port:     8080,
+						PathRules: []dataplane.PathRule{
+							{
+								Path:     "/coffee",
+								PathType: dataplane.PathTypePrefix,
+								MatchRules: []dataplane.MatchRule{
+									{
+										Match:        dataplane.Match{},
+										BackendGroup: backend,
+									},
+								},
+							},
+						},
+					},
+				},
+			},
+			expAbsent: []string{"auth_request", "proxy_pass_request_body"},
+		},
+		{
+			name: "two path rules where one has external auth and the other does not",
+			conf: dataplane.Configuration{
+				HTTPServers: []dataplane.VirtualServer{
+					{
+						Hostname: "example.com",
+						Port:     8080,
+						PathRules: []dataplane.PathRule{
+							{
+								Path:     "/protected",
+								PathType: dataplane.PathTypePrefix,
+								MatchRules: []dataplane.MatchRule{
+									{
+										Match:        dataplane.Match{},
+										BackendGroup: backend,
+										Filters: dataplane.HTTPFilters{
+											ExternalAuthFilter: &dataplane.HTTPExternalAuthFilter{
+												UpstreamName: "default_ext-auth_80",
+												InternalPath: "/_ngf-internal-ext-auth-test_route1_rule0",
+											},
+										},
+									},
+								},
+							},
+							{
+								Path:     "/public",
+								PathType: dataplane.PathTypePrefix,
+								MatchRules: []dataplane.MatchRule{
+									{
+										Match:        dataplane.Match{},
+										BackendGroup: backend,
+									},
+								},
+							},
+						},
+					},
+				},
+			},
+			expPresent: []string{
+				"location /protected",
+				"auth_request /_ngf-internal-ext-auth-test_route1_rule0;",
+				"location /public",
+			},
+		},
+	}
+
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			t.Parallel()
+			g := NewWithT(t)
+
+			gen := GeneratorImpl{}
+			results := gen.executeServers(test.conf, &policiesfakes.FakeGenerator{}, alwaysFalseKeepAliveChecker)
+
+			var httpData string
+			for _, res := range results {
+				if res.dest == httpConfigFile {
+					httpData = string(res.data)
+					break
+				}
+			}
+
+			for _, sub := range test.expPresent {
+				g.Expect(httpData).To(ContainSubstring(sub))
+			}
+			for _, absent := range test.expAbsent {
+				g.Expect(httpData).NotTo(ContainSubstring(absent))
+			}
+		})
+	}
+}
+
+func TestUpdateLocationExternalAuthFilter(t *testing.T) {
+	t.Parallel()
+
+	baseLocation := http.Location{
+		Path: "/coffee",
+		Type: http.ExternalLocationType,
+	}
+
+	tests := []struct {
+		filter   *dataplane.HTTPExternalAuthFilter
+		name     string
+		expected http.Location
+	}{
+		{
+			name:     "nil external auth filter returns location unchanged",
+			filter:   nil,
+			expected: baseLocation,
+		},
+		{
+			name: "basic external auth filter without forwardBody",
+			filter: &dataplane.HTTPExternalAuthFilter{
+				UpstreamName:           "default_ext-auth_80",
+				InternalPath:           "/_ngf-internal-ext-auth-default_route_rule0",
+				PathPrefix:             "/auth",
+				AllowedRequestHeaders:  []string{"X-Custom-Token"},
+				AllowedResponseHeaders: []string{"X-Auth-Status"},
+			},
+			expected: http.Location{
+				Path: "/coffee",
+				Type: http.ExternalLocationType,
+				AuthExternalRequest: &http.AuthExternalRequest{
+					InternalPath:           "/_ngf-internal-ext-auth-default_route_rule0",
+					UpstreamName:           "default_ext-auth_80",
+					PathPrefix:             "/auth",
+					AllowedRequestHeaders:  []string{"X-Custom-Token"},
+					AllowedResponseHeaders: []string{"X-Auth-Status"},
+				},
+			},
+		},
+		{
+			name: "external auth filter with forwardBody sets ClientMaxBodySize",
+			filter: &dataplane.HTTPExternalAuthFilter{
+				UpstreamName: "default_ext-auth_80",
+				InternalPath: "/_ngf-internal-ext-auth-default_route_rule0",
+				ForwardBody:  true,
+				MaxBodySize:  512,
+			},
+			expected: http.Location{
+				Path: "/coffee",
+				Type: http.ExternalLocationType,
+				AuthExternalRequest: &http.AuthExternalRequest{
+					InternalPath: "/_ngf-internal-ext-auth-default_route_rule0",
+					UpstreamName: "default_ext-auth_80",
+					ForwardBody:  true,
+				},
+				ClientMaxBodySize: 512,
+			},
+		},
+		{
+			name: "external auth filter with BackendTLSPolicy sets ProxySSLVerify",
+			filter: &dataplane.HTTPExternalAuthFilter{
+				UpstreamName: "default_ext-auth_80",
+				InternalPath: "/_ngf-internal-ext-auth-default_route_rule0",
+				VerifyTLS: &dataplane.VerifyTLS{
+					Hostname:   "auth.example.com",
+					RootCAPath: "/etc/ssl/certs/ca-certificates.crt",
+				},
+			},
+			expected: http.Location{
+				Path: "/coffee",
+				Type: http.ExternalLocationType,
+				AuthExternalRequest: &http.AuthExternalRequest{
+					InternalPath: "/_ngf-internal-ext-auth-default_route_rule0",
+					UpstreamName: "default_ext-auth_80",
+					ProxySSLVerify: &http.ProxySSLVerify{
+						Name:               "auth.example.com",
+						TrustedCertificate: "/etc/ssl/certs/ca-certificates.crt",
+					},
+				},
+			},
+		},
+	}
+
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			t.Parallel()
+			g := NewWithT(t)
+
+			result := updateLocationExternalAuthFilter(baseLocation, test.filter)
+			g.Expect(result).To(Equal(test.expected))
+		})
+	}
+}
+
+//nolint:gosec
+func TestExtractExternalAuthInternalLocations(t *testing.T) {
+	t.Parallel()
+
+	tests := []struct {
+		name      string
+		locations []http.Location
+		expected  []http.Location
+	}{
+		{
+			name: "no locations with external auth returns empty",
+			locations: []http.Location{
+				{Path: "/coffee", Type: http.ExternalLocationType},
+			},
+			expected: nil,
+		},
+		{
+			name: "generates internal location for external auth with body forwarding off",
+			locations: []http.Location{
+				{
+					Path: "/coffee",
+					Type: http.ExternalLocationType,
+					AuthExternalRequest: &http.AuthExternalRequest{
+						InternalPath:          "/_ngf-internal-ext-auth-default_route_rule0",
+						UpstreamName:          "default_ext-auth_80",
+						PathPrefix:            "/check",
+						AllowedRequestHeaders: []string{"X-Custom-Token"},
+					},
+				},
+			},
+			expected: []http.Location{
+				{
+					Path:      "/_ngf-internal-ext-auth-default_route_rule0",
+					Type:      http.InternalLocationType,
+					ProxyPass: "http://default_ext-auth_80/check",
+					ProxySetHeaders: []http.Header{
+						{Name: "Host", Value: "$gw_api_compliant_host"},
+						{Name: "Path", Value: "$request_uri"},
+						{Name: "Method", Value: "$request_method"},
+						{Name: "Authorization", Value: "$http_authorization"},
+						{Name: "X-Custom-Token", Value: "$http_x_custom_token"},
+					},
+					ProxyPassRequestBody:    "off",
+					ProxyPassRequestHeaders: "off",
+				},
+			},
+		},
+		{
+			name: "generates internal location with body forwarding on",
+			locations: []http.Location{
+				{
+					Path: "/coffee",
+					Type: http.ExternalLocationType,
+					AuthExternalRequest: &http.AuthExternalRequest{
+						InternalPath: "/_ngf-internal-ext-auth-default_route_rule0",
+						UpstreamName: "default_ext-auth_80",
+						ForwardBody:  true,
+					},
+				},
+			},
+			expected: []http.Location{
+				{
+					Path:      "/_ngf-internal-ext-auth-default_route_rule0",
+					Type:      http.InternalLocationType,
+					ProxyPass: "http://default_ext-auth_80",
+					ProxySetHeaders: []http.Header{
+						{Name: "Host", Value: "$gw_api_compliant_host"},
+						{Name: "Path", Value: "$request_uri"},
+						{Name: "Method", Value: "$request_method"},
+						{Name: "Authorization", Value: "$http_authorization"},
+					},
+					ProxyPassRequestHeaders: "off",
+				},
+			},
+		},
+		{
+			name: "generates https internal location when ProxySSLVerify is set",
+			locations: []http.Location{
+				{
+					Path: "/coffee",
+					Type: http.ExternalLocationType,
+					AuthExternalRequest: &http.AuthExternalRequest{
+						InternalPath: "/_ngf-internal-ext-auth-default_route_rule0",
+						UpstreamName: "default_ext-auth_443",
+						ProxySSLVerify: &http.ProxySSLVerify{
+							Name:               "auth.example.com",
+							TrustedCertificate: "/etc/nginx/certs/ca.crt",
+						},
+					},
+				},
+			},
+			expected: []http.Location{
+				{
+					Path:      "/_ngf-internal-ext-auth-default_route_rule0",
+					Type:      http.InternalLocationType,
+					ProxyPass: "https://default_ext-auth_443",
+					ProxySetHeaders: []http.Header{
+						{Name: "Host", Value: "$gw_api_compliant_host"},
+						{Name: "Path", Value: "$request_uri"},
+						{Name: "Method", Value: "$request_method"},
+						{Name: "Authorization", Value: "$http_authorization"},
+					},
+					ProxyPassRequestBody:    "off",
+					ProxyPassRequestHeaders: "off",
+					ProxySSLVerify: &http.ProxySSLVerify{
+						Name:               "auth.example.com",
+						TrustedCertificate: "/etc/nginx/certs/ca.crt",
+					},
+				},
+			},
+		},
+		{
+			name: "deduplicates internal locations with same path",
+			locations: []http.Location{
+				{
+					Path: "/coffee",
+					Type: http.ExternalLocationType,
+					AuthExternalRequest: &http.AuthExternalRequest{
+						InternalPath: "/_ngf-internal-ext-auth-default_route_rule0",
+						UpstreamName: "default_ext-auth_80",
+					},
+				},
+				{
+					Path: "/tea",
+					Type: http.ExternalLocationType,
+					AuthExternalRequest: &http.AuthExternalRequest{
+						InternalPath: "/_ngf-internal-ext-auth-default_route_rule0",
+						UpstreamName: "default_ext-auth_80",
+					},
+				},
+			},
+			expected: []http.Location{
+				{
+					Path:      "/_ngf-internal-ext-auth-default_route_rule0",
+					Type:      http.InternalLocationType,
+					ProxyPass: "http://default_ext-auth_80",
+					ProxySetHeaders: []http.Header{
+						{Name: "Host", Value: "$gw_api_compliant_host"},
+						{Name: "Path", Value: "$request_uri"},
+						{Name: "Method", Value: "$request_method"},
+						{Name: "Authorization", Value: "$http_authorization"},
+					},
+					ProxyPassRequestBody:    "off",
+					ProxyPassRequestHeaders: "off",
+				},
+			},
+		},
+	}
+
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			t.Parallel()
+			g := NewWithT(t)
+
+			result := extractExternalAuthInternalLocations(test.locations)
+			g.Expect(result).To(Equal(test.expected))
+		})
+	}
+}
+
+func TestAllValidBackendsAreH2C(t *testing.T) {
+	t.Parallel()
+
+	h2c := graph.AppProtocolTypeH2C
+
+	tests := []struct {
+		name     string
+		backends []dataplane.Backend
+		expected bool
+	}{
+		{
+			name:     "empty list – returns false",
+			backends: []dataplane.Backend{},
+			expected: false,
+		},
+		{
+			name: "no valid backends – returns false",
+			backends: []dataplane.Backend{
+				{Valid: false, AppProtocol: h2c},
+			},
+			expected: false,
+		},
+		{
+			name: "single h2c valid backend – returns true",
+			backends: []dataplane.Backend{
+				{Valid: true, AppProtocol: h2c},
+			},
+			expected: true,
+		},
+		{
+			name: "all valid backends h2c – returns true",
+			backends: []dataplane.Backend{
+				{Valid: true, AppProtocol: h2c},
+				{Valid: true, AppProtocol: h2c},
+			},
+			expected: true,
+		},
+		{
+			name: "mixed h2c and non-h2c valid backends – returns false",
+			backends: []dataplane.Backend{
+				{Valid: true, AppProtocol: h2c},
+				{Valid: true, AppProtocol: ""},
+			},
+			expected: false,
+		},
+		{
+			name: "h2c valid + non-h2c invalid – still true (invalid ignored)",
+			backends: []dataplane.Backend{
+				{Valid: true, AppProtocol: h2c},
+				{Valid: false, AppProtocol: ""},
+			},
+			expected: true,
+		},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+			g := NewWithT(t)
+			g.Expect(allValidBackendsAreH2C(tc.backends)).To(Equal(tc.expected))
+		})
+	}
+}
+
+// TestExecuteServers_ProxyHTTPVersion verifies end-to-end that proxy_http_version is
+// rendered correctly in the generated NGINX config.
+func TestExecuteServers_ProxyHTTPVersion(t *testing.T) {
+	t.Parallel()
+
+	makeBackend := func(appProtocol string, valid bool) dataplane.Backend {
+		return dataplane.Backend{
+			UpstreamName: "test_backend_80",
+			Valid:        valid,
+			Weight:       1,
+			AppProtocol:  appProtocol,
+		}
+	}
+
+	makePathRule := func(backends []dataplane.Backend, pols []policies.Policy) dataplane.PathRule {
+		return dataplane.PathRule{
+			Path:     "/app",
+			PathType: dataplane.PathTypePrefix,
+			MatchRules: []dataplane.MatchRule{
+				{
+					Match: dataplane.Match{},
+					BackendGroup: dataplane.BackendGroup{
+						Source:   types.NamespacedName{Namespace: "default", Name: "route1"},
+						RuleIdx:  0,
+						Backends: backends,
+					},
+				},
+			},
+			Policies: pols,
+		}
+	}
+
+	tests := []struct {
+		name           string
+		expPresent     string
+		expAbsent      string
+		serverPolicies []policies.Policy
+		pathRule       dataplane.PathRule
+	}{
+		{
+			// NGINX's own default is 1.1 – the directive must be omitted entirely.
+			name:      "no h2c backends – directive omitted (NGINX default)",
+			pathRule:  makePathRule([]dataplane.Backend{makeBackend("", true)}, nil),
+			expAbsent: "proxy_http_version",
+		},
+		{
+			name:       "all backends h2c – emits version 2",
+			pathRule:   makePathRule([]dataplane.Backend{makeBackend(graph.AppProtocolTypeH2C, true)}, nil),
+			expPresent: "proxy_http_version 2;",
+		},
+		{
+			// Mixed h2c/non-h2c falls back to NGINX default – directive omitted.
+			name: "mixed backends – directive omitted (fallback to NGINX default)",
+			pathRule: makePathRule([]dataplane.Backend{
+				makeBackend(graph.AppProtocolTypeH2C, true),
+				makeBackend("", true),
+			}, nil),
+			expAbsent: "proxy_http_version",
+		},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+			g := NewWithT(t)
+
+			conf := dataplane.Configuration{
+				HTTPServers: []dataplane.VirtualServer{
+					{
+						Hostname:  "http.example.com",
+						Port:      8080,
+						PathRules: []dataplane.PathRule{tc.pathRule},
+						Policies:  tc.serverPolicies,
+					},
+				},
+				BaseHTTPConfig: dataplane.BaseHTTPConfig{},
+			}
+			gen := GeneratorImpl{}
+			results := gen.executeServers(conf, &policiesfakes.FakeGenerator{}, alwaysFalseKeepAliveChecker)
+
+			var serverConf string
+			for _, res := range results {
+				if res.dest == httpConfigFile {
+					serverConf = string(res.data)
+					break
+				}
+			}
+
+			g.Expect(serverConf).NotTo(BeEmpty())
+			if tc.expPresent != "" {
+				g.Expect(serverConf).To(ContainSubstring(tc.expPresent))
+			}
+			if tc.expAbsent != "" {
+				g.Expect(serverConf).NotTo(ContainSubstring(tc.expAbsent))
+			}
+		})
+	}
+}
+
+// TestUpdateLocationProxySettings_Headers verifies that the correct proxy_set_header directives
+// are included or omitted depending on the backend protocol:
+//   - h2c backends (proxy_http_version 2): Upgrade and Connection headers must be omitted
+//   - plain HTTP backends: Upgrade and Connection headers must be present
+//   - gRPC backends: Authority header present; Upgrade and Connection omitted
+func TestUpdateLocationProxySettings_Headers(t *testing.T) {
+	t.Parallel()
+
+	h2cBackend := dataplane.Backend{
+		UpstreamName: "test_h2c_80",
+		Valid:        true,
+		Weight:       1,
+		AppProtocol:  graph.AppProtocolTypeH2C,
+	}
+	normalBackend := dataplane.Backend{
+		UpstreamName: "test_normal_80",
+		Valid:        true,
+		Weight:       1,
+	}
+
+	makeMatchRule := func(backends ...dataplane.Backend) dataplane.MatchRule {
+		return dataplane.MatchRule{
+			Match: dataplane.Match{},
+			BackendGroup: dataplane.BackendGroup{
+				Source:   types.NamespacedName{Namespace: "default", Name: "route1"},
+				RuleIdx:  0,
+				Backends: backends,
+			},
+		}
+	}
+
+	tests := []struct {
+		name       string
+		expHeaders []http.Header
+		expAbsent  []string
+		matchRule  dataplane.MatchRule
+		grpc       bool
+	}{
+		{
+			name:      "h2c backend – Upgrade and Connection headers omitted",
+			matchRule: makeMatchRule(h2cBackend),
+			expAbsent: []string{"Upgrade", "Connection"},
+		},
+		{
+			name:      "non-h2c backend – Upgrade and Connection headers present",
+			matchRule: makeMatchRule(normalBackend),
+			expHeaders: []http.Header{
+				{Name: "Upgrade", Value: "$http_upgrade"},
+				{Name: "Connection", Value: "$connection_upgrade"},
+			},
+		},
+		{
+			name:      "gRPC backend – Authority header present, Upgrade and Connection omitted",
+			matchRule: makeMatchRule(normalBackend),
+			grpc:      true,
+			expHeaders: []http.Header{
+				{Name: "Authority", Value: "$gw_api_compliant_host"},
+			},
+			expAbsent: []string{"Upgrade", "Connection"},
+		},
+		{
+			name:      "mixed h2c and non-h2c – falls back to HTTP/1.1, Upgrade and Connection present",
+			matchRule: makeMatchRule(h2cBackend, normalBackend),
+			expHeaders: []http.Header{
+				{Name: "Upgrade", Value: "$http_upgrade"},
+				{Name: "Connection", Value: "$connection_upgrade"},
+			},
+		},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+			g := NewWithT(t)
+
+			loc := updateLocationProxySettings(
+				http.Location{},
+				tc.matchRule,
+				tc.grpc,
+				false, // inferenceBackend
+				alwaysFalseKeepAliveChecker,
+				nil, // disableBaseProxySetHeaders
+			)
+
+			headersByName := make(map[string]string, len(loc.ProxySetHeaders))
+			for _, h := range loc.ProxySetHeaders {
+				headersByName[h.Name] = h.Value
+			}
+
+			for _, h := range tc.expHeaders {
+				g.Expect(headersByName).To(HaveKeyWithValue(h.Name, h.Value))
+			}
+			for _, name := range tc.expAbsent {
+				g.Expect(headersByName).NotTo(HaveKey(name))
 			}
 		})
 	}

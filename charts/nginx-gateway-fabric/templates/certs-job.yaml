@@ -122,12 +122,13 @@ spec:
       {{ toYaml . | nindent 8 }}
       {{- end }}
     spec:
-      automountServiceAccountToken: true
+      automountServiceAccountToken: {{ .Values.certGenerator.automountServiceAccountToken }}
       containers:
       - args:
         - generate-certs
         - --service={{ include "nginx-gateway.fullname" . }}
         - --cluster-domain={{ .Values.clusterDomain }}
+        - --server-tls-domain={{ .Values.serverTLSDomain }}
         - --server-tls-secret={{ .Values.certGenerator.serverTLSSecretName }}
         - --agent-tls-secret={{ .Values.certGenerator.agentTLSSecretName }}
         {{- if .Values.certGenerator.overwrite }}
@@ -151,6 +152,10 @@ spec:
           readOnlyRootFilesystem: true
           runAsUser: 101
           runAsGroup: 1001
+        {{- with .Values.certGenerator.extraVolumeMounts }}
+        volumeMounts:
+        {{- toYaml . | nindent 8 }}
+        {{- end }}
       restartPolicy: Never
       serviceAccountName: {{ include "nginx-gateway.fullname" . }}-cert-generator
       securityContext:
@@ -171,6 +176,10 @@ spec:
       {{- if .Values.certGenerator.nodeSelector }}
       nodeSelector:
       {{- toYaml .Values.certGenerator.nodeSelector | nindent 8 }}
+      {{- end }}
+      {{- with .Values.certGenerator.extraVolumes }}
+      volumes:
+      {{- toYaml . | nindent 6 }}
       {{- end }}
   ttlSecondsAfterFinished: {{ .Values.certGenerator.ttlSecondsAfterFinished }}
 {{- end }}

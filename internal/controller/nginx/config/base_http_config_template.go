@@ -11,6 +11,12 @@ resolver{{ range $addr := .DNSResolver.Addresses }} {{ $addr }}{{ end }}{{ if .D
 resolver_timeout {{ .DNSResolver.Timeout }};
 {{- end }}
 {{- end }}
+{{ if .WAF -}}
+app_protect_enforcer_address 127.0.0.1:50000;
+{{- if .WAFCookieSeed }}
+app_protect_cookie_seed {{ .WAFCookieSeed }};
+{{- end }}
+{{ end -}}
 
 # Set $gw_api_compliant_host variable to the value of $http_host unless $http_host is empty, then set it to the value
 # of $host. We prefer $http_host because it contains the original value of the host header, which is required by the
@@ -79,11 +85,43 @@ proxy_ssl_certificate /etc/nginx/secrets/{{ $.GatewaySecretID }}.pem;
 proxy_ssl_certificate_key /etc/nginx/secrets/{{ $.GatewaySecretID }}.pem;
 {{- end }}
 
+{{- range .ClaimSets }}
+auth_jwt_claim_set {{ .Variable }}{{ range .Claims }} {{ . }}{{ end }};
+{{- end }}
+
 {{ range $i := .Includes -}}
 include {{ $i.Name }};
 {{ end -}}
 
 server_tokens {{ .ServerTokens }};
+
+{{- if .Compression }}
+gzip on;
+{{- if .Compression.Level }}
+gzip_comp_level {{ .Compression.Level }};
+{{- end }}
+{{- if ne .Compression.MinLength nil }}
+gzip_min_length {{ .Compression.MinLength }};
+{{- end }}
+{{- if .Compression.BufferNumber }}
+gzip_buffers {{ .Compression.BufferNumber }} {{ .Compression.BufferSize }};
+{{- end }}
+{{- if .Compression.HTTPVersion }}
+gzip_http_version {{ .Compression.HTTPVersion }};
+{{- end }}
+{{- if .Compression.MimeTypes }}
+gzip_types{{ range .Compression.MimeTypes }} "{{ . }}"{{ end }};
+{{- end }}
+{{- if .Compression.Proxied }}
+gzip_proxied{{ range .Compression.Proxied }} {{ . }}{{ end }};
+{{- end }}
+{{- if .Compression.Disable }}
+gzip_disable{{ range .Compression.Disable }} "{{ . }}"{{ end }};
+{{- end }}
+{{- if .Compression.Vary }}
+gzip_vary on;
+{{- end }}
+{{- end }}
 
 
 {{- range .OIDCProviders }}

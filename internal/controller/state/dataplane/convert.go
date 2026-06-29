@@ -245,7 +245,7 @@ func convertAuthenticationFilterBasicAuth(
 func convertAuthenticationFilterOIDC(
 	filter *graph.AuthenticationFilter,
 	referencedSecrets map[types.NamespacedName]*secrets.Secret,
-) *OIDCProvider {
+) *AuthOIDC {
 	if filter.Source.Spec.OIDC == nil {
 		return nil
 	}
@@ -300,7 +300,22 @@ func convertAuthenticationFilterOIDC(
 		oidc.TokenHint = specOIDC.Logout.TokenHint
 	}
 
-	return oidc
+	result := &AuthOIDC{
+		Provider: oidc,
+	}
+
+	// Populate authorization fields (auth_jwt_require + proxy_set_header) from the AuthZConfig
+	if specOIDC.Authorization != nil {
+		filterNsName := strings.Join([]string{filter.Source.Namespace, filter.Source.Name}, "_")
+		filterPrefix := sanitizeVariablePrefix(filterNsName)
+		authZConfig := buildAuthZConfigFromAuthZSpec(filterPrefix, specOIDC.Authorization)
+		if authZConfig != nil {
+			result.AuthRequireVariable = authZConfig.RequireVariable
+			result.AuthZProxySetHeaders = authZConfig.ProxySetHeaders
+		}
+	}
+
+	return result
 }
 
 func convertAuthenticationFilterJwtAuth(
@@ -333,6 +348,20 @@ func convertAuthenticationFilterJwtAuth(
 				Realm:    specJWT.Realm,
 				KeyCache: specJWT.KeyCache,
 				Remote:   remote,
+			}
+		}
+
+		// Populate authorization fields (auth_jwt_require + proxy_set_header) from the AuthZConfig
+		if result != nil {
+			result.Leeway = specJWT.Leeway
+			if specJWT.Authorization != nil {
+				filterNsName := strings.Join([]string{filter.Source.Namespace, filter.Source.Name}, "_")
+				filterPrefix := sanitizeVariablePrefix(filterNsName)
+				authZConfig := buildAuthZConfigFromAuthZSpec(filterPrefix, specJWT.Authorization)
+				if authZConfig != nil {
+					result.AuthRequireVariable = authZConfig.RequireVariable
+					result.AuthZProxySetHeaders = authZConfig.ProxySetHeaders
+				}
 			}
 		}
 	}
@@ -380,6 +409,22 @@ func convertDNSResolverAddresses(addresses []ngfAPIv1alpha2.DNSResolverAddress) 
 	result := make([]string, 0, len(addresses))
 	for _, addr := range addresses {
 		result = append(result, addr.Value)
+	}
+	return result
+}
+
+func convertWAFBundles(graphBundles map[graph.WAFBundleKey]*graph.WAFBundleData) map[WAFBundleID]WAFBundle {
+	result := make(map[WAFBundleID]WAFBundle, len(graphBundles))
+
+	for key, value := range graphBundles {
+		dataplaneKey := WAFBundleID(key)
+
+		var dataplaneValue WAFBundle
+		if value != nil {
+			dataplaneValue = WAFBundle(value.Data)
+		}
+
+		result[dataplaneKey] = dataplaneValue
 	}
 
 	return result
@@ -454,6 +499,42 @@ func setOIDCCRLCert(
 		oidc.CRLBundleID = generateCRLBundleID(nsName)
 		oidc.CRLData = secret.Source.Data[secrets.CRLKey]
 	}
+}
+
+func convertHTTPExternalAuthFilter(
+	filter *v1.HTTPExternalAuthFilter,
+	resolvedBackendRef graph.BackendRef,
+	routeNsName types.NamespacedName,
+	ruleIdx int,
+	gwNsName types.NamespacedName,
+) *HTTPExternalAuthFilter {
+	if filter == nil {
+		return nil
+	}
+
+	result := &HTTPExternalAuthFilter{
+		UpstreamName: resolvedBackendRef.ServicePortReference(),
+		InternalPath: generateExternalAuthInternalPath(routeNsName, ruleIdx),
+		VerifyTLS:    convertBackendTLS(resolvedBackendRef.BackendTLSPolicy, gwNsName),
+	}
+
+	if filter.HTTPAuthConfig != nil {
+		result.PathPrefix = filter.HTTPAuthConfig.Path
+		result.AllowedRequestHeaders = filter.HTTPAuthConfig.AllowedRequestHeaders
+		result.AllowedResponseHeaders = filter.HTTPAuthConfig.AllowedResponseHeaders
+	}
+
+	if filter.ForwardBody != nil && filter.ForwardBody.MaxSize > 0 {
+		result.ForwardBody = true
+		result.MaxBodySize = filter.ForwardBody.MaxSize
+	}
+
+	return result
+}
+
+func generateExternalAuthInternalPath(routeNsName types.NamespacedName, ruleIdx int) string {
+	return fmt.Sprintf("%s-ext-auth-%s_%s_rule%d",
+		http.InternalRoutePathPrefix, routeNsName.Namespace, routeNsName.Name, ruleIdx)
 }
 
 func buildSortedExtraAuthArgs(extraAuthArgs map[string]string) string {

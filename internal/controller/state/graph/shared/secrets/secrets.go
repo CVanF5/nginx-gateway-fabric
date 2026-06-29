@@ -54,6 +54,18 @@ const (
 
 	// N1CDataplaneKey is the dataplane key for the NGINX One Console.
 	N1CDataplaneKey = "dataplane.key"
+
+	// BundleUsernameKey is the Secret key for WAF bundle Basic Auth username.
+	BundleUsernameKey = "username"
+
+	// BundlePasswordKey is the Secret key for WAF bundle Basic Auth password.
+	BundlePasswordKey = "password"
+
+	// BundleTokenKey is the Secret key for WAF bundle Bearer Token authentication.
+	BundleTokenKey = "token"
+
+	// PLMS3Secret is the Secret data key for the PLM S3 storage secret access key.
+	PLMS3Secret = "seaweedfs_admin_secret"
 )
 
 // CertificateBundle is used to submit certificate data to nginx that is kubernetes aware.

@@ -132,6 +132,12 @@ Create namespaced RBAC rules.
 - apiGroups:
   - ""
   resources:
+  - services/status
+  verbs:
+  - patch
+- apiGroups:
+  - ""
+  resources:
   - pods
   verbs:
   - get
@@ -176,6 +182,17 @@ Create namespaced RBAC rules.
   - get
   - watch
 - apiGroups:
+  - policy
+  resources:
+  - poddisruptionbudgets
+  verbs:
+  - create
+  - update
+  - delete
+  - list
+  - get
+  - watch
+- apiGroups:
   - discovery.k8s.io
   resources:
   - endpointslices
@@ -191,6 +208,7 @@ Create namespaced RBAC rules.
   - grpcroutes
   - backendtlspolicies
   - tlsroutes
+  - listenersets
   {{- if .Values.nginxGateway.gwAPIExperimentalFeatures.enable }}
   - tcproutes
   - udproutes
@@ -208,6 +226,7 @@ Create namespaced RBAC rules.
   - grpcroutes/status
   - backendtlspolicies/status
   - tlsroutes/status
+  - listenersets/status
   {{- if .Values.nginxGateway.gwAPIExperimentalFeatures.enable }}
   - tcproutes/status
   - udproutes/status
@@ -232,6 +251,7 @@ Create namespaced RBAC rules.
   - authenticationfilters
   - proxysettingspolicies
   - ratelimitpolicies
+  - wafpolicies
   {{- if or .Values.nginxGateway.snippetsFilters.enable .Values.nginxGateway.snippets.enable }}
   - snippetsfilters
   {{- end }}
@@ -251,6 +271,7 @@ Create namespaced RBAC rules.
   - authenticationfilters/status
   - proxysettingspolicies/status
   - ratelimitpolicies/status
+  - wafpolicies/status
   {{- if or .Values.nginxGateway.snippetsFilters.enable .Values.nginxGateway.snippets.enable }}
   - snippetsfilters/status
   {{- end }}
@@ -275,6 +296,18 @@ Create namespaced RBAC rules.
   - inferencepools/finalizers
   verbs:
   - update
+  {{- end }}
+  {{- if .Values.nginxGateway.plmStorage.url }}
+- apiGroups:
+  - appprotect.f5.com
+  resources:
+  - appolicies
+  - aplogconfs
+  verbs:
+  - get
+  - list
+  - patch
+  - watch
   {{- end }}
   {{- if .Values.nginxGateway.leaderElection.enable }}
 - apiGroups:

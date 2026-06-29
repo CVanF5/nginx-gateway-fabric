@@ -4,11 +4,11 @@ import (
 	"context"
 	"fmt"
 	"slices"
+	"strings"
 	"time"
 
 	"github.com/go-logr/logr"
 	tel "github.com/nginx/telemetry-exporter/pkg/telemetry"
-	"github.com/prometheus/client_golang/prometheus"
 	"go.opentelemetry.io/otel/exporters/otlp/otlptrace/otlptracegrpc"
 	"google.golang.org/grpc"
 	appsv1 "k8s.io/api/apps/v1"
@@ -16,6 +16,7 @@ import (
 	autoscalingv2 "k8s.io/api/autoscaling/v2"
 	apiv1 "k8s.io/api/core/v1"
 	discoveryV1 "k8s.io/api/discovery/v1"
+	policyv1 "k8s.io/api/policy/v1"
 	rbacv1 "k8s.io/api/rbac/v1"
 	apiext "k8s.io/apiextensions-apiserver/pkg/apis/apiextensions/v1"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
@@ -43,6 +44,7 @@ import (
 
 	ngfAPIv1alpha1 "github.com/nginx/nginx-gateway-fabric/v2/apis/v1alpha1"
 	ngfAPIv1alpha2 "github.com/nginx/nginx-gateway-fabric/v2/apis/v1alpha2"
+	wafv1 "github.com/nginx/nginx-gateway-fabric/v2/apis/waf/v1"
 	"github.com/nginx/nginx-gateway-fabric/v2/internal/controller/config"
 	"github.com/nginx/nginx-gateway-fabric/v2/internal/controller/crd"
 	"github.com/nginx/nginx-gateway-fabric/v2/internal/controller/licensing"
@@ -57,6 +59,7 @@ import (
 	"github.com/nginx/nginx-gateway-fabric/v2/internal/controller/nginx/config/policies/ratelimit"
 	"github.com/nginx/nginx-gateway-fabric/v2/internal/controller/nginx/config/policies/snippetspolicy"
 	"github.com/nginx/nginx-gateway-fabric/v2/internal/controller/nginx/config/policies/upstreamsettings"
+	"github.com/nginx/nginx-gateway-fabric/v2/internal/controller/nginx/config/policies/waf"
 	ngxvalidation "github.com/nginx/nginx-gateway-fabric/v2/internal/controller/nginx/config/validation"
 	"github.com/nginx/nginx-gateway-fabric/v2/internal/controller/provisioner"
 	"github.com/nginx/nginx-gateway-fabric/v2/internal/controller/state"
@@ -76,6 +79,9 @@ import (
 	"github.com/nginx/nginx-gateway-fabric/v2/internal/framework/kinds"
 	"github.com/nginx/nginx-gateway-fabric/v2/internal/framework/runnables"
 	ngftypes "github.com/nginx/nginx-gateway-fabric/v2/internal/framework/types"
+	"github.com/nginx/nginx-gateway-fabric/v2/internal/framework/waf/fetch"
+	s3fetch "github.com/nginx/nginx-gateway-fabric/v2/internal/framework/waf/fetch/s3"
+	wafpolling "github.com/nginx/nginx-gateway-fabric/v2/internal/framework/waf/poller"
 )
 
 const (
@@ -97,10 +103,24 @@ func init() {
 	utilruntime.Must(apiext.AddToScheme(scheme))
 	utilruntime.Must(appsv1.AddToScheme(scheme))
 	utilruntime.Must(autoscalingv2.AddToScheme(scheme))
+	utilruntime.Must(policyv1.AddToScheme(scheme))
 	utilruntime.Must(authv1.AddToScheme(scheme))
 	utilruntime.Must(rbacv1.AddToScheme(scheme))
 	utilruntime.Must(gatewayv1beta1.Install(scheme))
 	utilruntime.Must(inference.Install(scheme))
+
+	// Pre-register unstructured AP types (and their List variants) so fake clients built
+	// with this scheme don't lazily mutate the shared scheme during parallel test execution.
+	scheme.AddKnownTypeWithName(kinds.APPolicyGVK, kinds.NewAPPolicyObject())
+	scheme.AddKnownTypeWithName(kinds.APLogConfGVK, kinds.NewAPLogConfObject())
+	scheme.AddKnownTypeWithName(
+		kinds.APPolicyGVK.GroupVersion().WithKind(kinds.APPolicy+"List"),
+		kinds.NewAPPolicyList(),
+	)
+	scheme.AddKnownTypeWithName(
+		kinds.APLogConfGVK.GroupVersion().WithKind(kinds.APLogConf+"List"),
+		kinds.NewAPLogConfList(),
+	)
 }
 
 func StartManager(cfg config.Config) error {
@@ -138,6 +158,11 @@ func StartManager(cfg config.Config) error {
 		return err
 	}
 
+	wafFetcher := createWAFFetcher(cfg.Logger.WithName("wafFetcher"))
+	var wafPollerManager wafpolling.Manager
+
+	plmFetcher, plmSecretNames := createPLMFetcher(cfg)
+
 	processor := state.NewChangeProcessorImpl(state.ChangeProcessorConfig{
 		GatewayCtlrName:  cfg.GatewayCtlrName,
 		GatewayClassName: cfg.GatewayClassName,
@@ -151,6 +176,15 @@ func StartManager(cfg config.Config) error {
 		EventRecorder:  recorder,
 		MustExtractGVK: mustExtractGVK,
 		PlusSecrets:    plusSecrets,
+		WAFFetcher:     wafFetcher,
+		PLMFetcher:     plmFetcher,
+		PLMSecretNames: plmSecretNames,
+		PolledWAFBundles: func() map[graph.WAFBundleKey]*graph.WAFBundleData {
+			if wafPollerManager == nil {
+				return nil
+			}
+			return wafPollerManager.GetLatestBundles()
+		},
 		FeatureFlags: graph.FeatureFlags{
 			Plus:         cfg.Plus,
 			Experimental: cfg.ExperimentalFeatures,
@@ -158,20 +192,6 @@ func StartManager(cfg config.Config) error {
 		DiscoveredCRDs: discoveredCRDs,
 		Snippets:       cfg.Snippets,
 	})
-
-	var handlerCollector handlerMetricsCollector = collectors.NewControllerNoopCollector()
-
-	if cfg.MetricsConfig.Enabled {
-		constLabels := map[string]string{"class": cfg.GatewayClassName}
-
-		handlerCollector = collectors.NewControllerCollector(constLabels)
-		handlerCollector, ok := handlerCollector.(prometheus.Collector)
-		if !ok {
-			return fmt.Errorf("handlerCollector is not a prometheus.Collector: %w", status.ErrFailedAssert)
-		}
-
-		metrics.Registry.MustRegister(handlerCollector)
-	}
 
 	statusUpdater := status.NewUpdater(
 		mgr.GetClient(),
@@ -186,6 +206,106 @@ func StartManager(cfg config.Config) error {
 	})
 
 	statusQueue := status.NewQueue()
+
+	nginxUpdater, err := createAgentServices(cfg, mgr, statusQueue)
+	if err != nil {
+		return err
+	}
+
+	nginxProvisioner, err := createAndRegisterProvisioner(ctx, cfg, mgr, nginxUpdater, statusQueue, recorder)
+	if err != nil {
+		return err
+	}
+
+	wafPollerManager = createWAFPollerManager(ctx, cfg, wafFetcher, nginxUpdater, statusQueue, eventCh)
+
+	eventHandler := newEventHandlerImpl(eventHandlerConfig{
+		ctx:              ctx,
+		nginxUpdater:     nginxUpdater,
+		nginxProvisioner: nginxProvisioner,
+		metricsCollector: createMetricsCollector(cfg),
+		statusUpdater:    groupStatusUpdater,
+		processor:        processor,
+		serviceResolver:  resolver.NewServiceResolverImpl(mgr.GetClient()),
+		generator: ngxcfg.NewGeneratorImpl(
+			cfg.Plus,
+			&cfg.UsageReportConfig,
+			cfg.Logger.WithName("generator"),
+		),
+		k8sClient:               mgr.GetClient(),
+		logger:                  cfg.Logger.WithName("eventHandler"),
+		logLevelSetter:          logLevelSetter,
+		eventRecorder:           recorder,
+		deployCtxCollector:      deployCtxCollector,
+		graphBuiltHealthChecker: healthChecker,
+		gatewayPodConfig:        cfg.GatewayPodConfig,
+		controlConfigNSName:     controlConfigNSName,
+		gatewayCtlrName:         cfg.GatewayCtlrName,
+		gatewayInstanceName:     cfg.GatewayPodConfig.InstanceName,
+		gatewayClassName:        cfg.GatewayClassName,
+		plus:                    cfg.Plus,
+		statusQueue:             statusQueue,
+		nginxDeployments:        nginxUpdater.NginxDeployments,
+		wafPollerManager:        wafPollerManager,
+		inferenceExtension:      cfg.InferenceExtension,
+		plmEnabled:              cfg.PLMStorageConfig != nil,
+	})
+
+	objects, objectLists := prepareFirstEventBatchPreparerArgs(cfg, discoveredCRDs)
+
+	firstBatchPreparer := events.NewFirstEventBatchPreparerImpl(mgr.GetCache(), objects, objectLists)
+	eventLoop := events.NewEventLoop(
+		eventCh,
+		cfg.Logger.WithName("eventLoop"),
+		eventHandler,
+		firstBatchPreparer,
+	)
+
+	if err = mgr.Add(&runnables.LeaderOrNonLeader{Runnable: eventLoop}); err != nil {
+		return fmt.Errorf("cannot register event loop: %w", err)
+	}
+
+	if err = mgr.Add(runnables.NewCallFunctionsAfterBecameLeader([]func(context.Context){
+		groupStatusUpdater.Enable,
+		nginxProvisioner.Enable,
+		eventHandler.enable,
+	})); err != nil {
+		return fmt.Errorf("cannot register functions that get called after Pod becomes leader: %w", err)
+	}
+
+	if err = registerTelemetry(cfg, mgr, processor, eventHandler, healthChecker); err != nil {
+		return err
+	}
+
+	cfg.Logger.Info("Starting manager")
+	go func() {
+		<-ctx.Done()
+		cfg.Logger.Info("Shutting down")
+	}()
+
+	return mgr.Start(ctx)
+}
+
+// createMetricsCollector creates a handler metrics collector and registers it with the Prometheus registry if enabled.
+func createMetricsCollector(cfg config.Config) handlerMetricsCollector {
+	if !cfg.MetricsConfig.Enabled {
+		return collectors.NewControllerNoopCollector()
+	}
+
+	constLabels := map[string]string{"class": cfg.GatewayClassName}
+
+	handlerCollector := collectors.NewControllerCollector(constLabels)
+	metrics.Registry.MustRegister(handlerCollector)
+
+	return handlerCollector
+}
+
+// createAgentServices creates the NGINX agent updater and gRPC server, and registers the server with the manager.
+func createAgentServices(
+	cfg config.Config,
+	mgr manager.Manager,
+	statusQueue *status.Queue,
+) (*agent.NginxUpdaterImpl, error) {
 	resetConnChan := make(chan struct{})
 	nginxUpdater := agent.NewNginxUpdater(
 		cfg.Logger.WithName("nginxUpdater"),
@@ -213,8 +333,25 @@ func StartManager(cfg config.Config) error {
 		resetConnChan,
 	)
 
-	if err = mgr.Add(&runnables.LeaderOrNonLeader{Runnable: grpcServer}); err != nil {
-		return fmt.Errorf("cannot register grpc server: %w", err)
+	if err := mgr.Add(&runnables.LeaderOrNonLeader{Runnable: grpcServer}); err != nil {
+		return nil, fmt.Errorf("cannot register grpc server: %w", err)
+	}
+
+	return nginxUpdater, nil
+}
+
+// createAndRegisterProvisioner creates the NGINX provisioner and registers its event loop with the manager.
+func createAndRegisterProvisioner(
+	ctx context.Context,
+	cfg config.Config,
+	mgr manager.Manager,
+	nginxUpdater *agent.NginxUpdaterImpl,
+	statusQueue *status.Queue,
+	recorder k8sEvents.EventRecorder,
+) (*provisioner.NginxProvisioner, error) {
+	serverTLSDomain := cfg.ServerTLSDomain
+	if serverTLSDomain == "" {
+		serverTLSDomain = "svc"
 	}
 
 	nginxProvisioner, provLoop, err := provisioner.NewNginxProvisioner(
@@ -227,6 +364,7 @@ func StartManager(cfg config.Config) error {
 			EventRecorder:                  recorder,
 			GatewayPodConfig:               &cfg.GatewayPodConfig,
 			GCName:                         cfg.GatewayClassName,
+			GatewayCtlrName:                cfg.GatewayCtlrName,
 			AgentTLSSecretName:             cfg.AgentTLSSecretName,
 			NGINXSCCName:                   cfg.NGINXSCCName,
 			Plus:                           cfg.Plus,
@@ -236,100 +374,94 @@ func StartManager(cfg config.Config) error {
 			InferenceExtension:             cfg.InferenceExtension,
 			EndpointPickerDisableTLS:       cfg.EndpointPickerDisableTLS,
 			EndpointPickerTLSSkipVerify:    cfg.EndpointPickerTLSSkipVerify,
+			ServerTLSDomain:                serverTLSDomain,
 		},
 	)
 	if err != nil {
-		return fmt.Errorf("error building provisioner: %w", err)
+		return nil, fmt.Errorf("error building provisioner: %w", err)
 	}
 
 	if err := mgr.Add(&runnables.LeaderOrNonLeader{Runnable: provLoop}); err != nil {
-		return fmt.Errorf("cannot register provisioner event loop: %w", err)
+		return nil, fmt.Errorf("cannot register provisioner event loop: %w", err)
 	}
 
-	eventHandler := newEventHandlerImpl(eventHandlerConfig{
-		ctx:              ctx,
-		nginxUpdater:     nginxUpdater,
-		nginxProvisioner: nginxProvisioner,
-		metricsCollector: handlerCollector,
-		statusUpdater:    groupStatusUpdater,
-		processor:        processor,
-		serviceResolver:  resolver.NewServiceResolverImpl(mgr.GetClient()),
-		generator: ngxcfg.NewGeneratorImpl(
-			cfg.Plus,
-			&cfg.UsageReportConfig,
-			cfg.Logger.WithName("generator"),
-		),
-		k8sClient:               mgr.GetClient(),
-		logger:                  cfg.Logger.WithName("eventHandler"),
-		logLevelSetter:          logLevelSetter,
-		eventRecorder:           recorder,
-		deployCtxCollector:      deployCtxCollector,
-		graphBuiltHealthChecker: healthChecker,
-		gatewayPodConfig:        cfg.GatewayPodConfig,
-		controlConfigNSName:     controlConfigNSName,
-		gatewayCtlrName:         cfg.GatewayCtlrName,
-		gatewayInstanceName:     cfg.GatewayPodConfig.InstanceName,
-		gatewayClassName:        cfg.GatewayClassName,
-		plus:                    cfg.Plus,
-		statusQueue:             statusQueue,
-		nginxDeployments:        nginxUpdater.NginxDeployments,
-		inferenceExtension:      cfg.InferenceExtension,
+	return nginxProvisioner, nil
+}
+
+// createWAFPollerManager creates a WAF polling manager if Plus is enabled.
+// Returns nil when Plus is not enabled.
+func createWAFPollerManager(
+	ctx context.Context,
+	cfg config.Config,
+	wafFetcher fetch.Fetcher,
+	nginxUpdater *agent.NginxUpdaterImpl,
+	statusQueue *status.Queue,
+	eventCh chan<- any,
+) wafpolling.Manager {
+	if !cfg.Plus {
+		return nil
+	}
+
+	return wafpolling.NewManager(wafpolling.ManagerConfig{
+		Logger:      cfg.Logger.WithName("wafPollingManager"),
+		Fetcher:     wafFetcher,
+		Deployments: nginxUpdater.NginxDeployments,
+		EventCh:     eventCh,
+		Ctx:         ctx,
+		StatusCallback: func(targets []types.NamespacedName) {
+			for _, nsName := range targets {
+				dep := nginxUpdater.NginxDeployments.Get(nsName)
+				if dep == nil {
+					continue
+				}
+				statusQueue.Enqueue(&status.QueueObject{
+					UpdateType: status.UpdateAll,
+					Deployment: status.Deployment{
+						NamespacedName: nsName,
+						GatewayName:    dep.GetGatewayName(),
+					},
+				})
+			}
+		},
+	})
+}
+
+// registerTelemetry sets up product telemetry if enabled.
+func registerTelemetry(
+	cfg config.Config,
+	mgr manager.Manager,
+	processor *state.ChangeProcessorImpl,
+	eventHandler *eventHandlerImpl,
+	healthChecker *graphBuiltHealthChecker,
+) error {
+	if !cfg.ProductTelemetryConfig.Enabled {
+		return nil
+	}
+
+	dataCollector := telemetry.NewDataCollectorImpl(telemetry.DataCollectorConfig{
+		K8sClientReader:     mgr.GetAPIReader(),
+		GraphGetter:         processor,
+		ConfigurationGetter: eventHandler,
+		Version:             cfg.GatewayPodConfig.Version,
+		PodNSName: types.NamespacedName{
+			Namespace: cfg.GatewayPodConfig.Namespace,
+			Name:      cfg.GatewayPodConfig.Name,
+		},
+		ImageSource:               cfg.ImageSource,
+		Flags:                     cfg.Flags,
+		NginxOneConsoleConnection: cfg.NginxOneConsoleTelemetryConfig.DataplaneKeySecretName != "",
 	})
 
-	objects, objectLists := prepareFirstEventBatchPreparerArgs(cfg, discoveredCRDs)
-
-	firstBatchPreparer := events.NewFirstEventBatchPreparerImpl(mgr.GetCache(), objects, objectLists)
-	eventLoop := events.NewEventLoop(
-		eventCh,
-		cfg.Logger.WithName("eventLoop"),
-		eventHandler,
-		firstBatchPreparer,
-	)
-
-	if err = mgr.Add(&runnables.LeaderOrNonLeader{Runnable: eventLoop}); err != nil {
-		return fmt.Errorf("cannot register event loop: %w", err)
+	job, err := createTelemetryJob(cfg, dataCollector, healthChecker.getReadyCh())
+	if err != nil {
+		return fmt.Errorf("cannot create telemetry job: %w", err)
 	}
 
-	if err = mgr.Add(runnables.NewCallFunctionsAfterBecameLeader([]func(context.Context){
-		groupStatusUpdater.Enable,
-		nginxProvisioner.Enable,
-		eventHandler.enable,
-	})); err != nil {
-		return fmt.Errorf("cannot register functions that get called after Pod becomes leader: %w", err)
+	if err = mgr.Add(job); err != nil {
+		return fmt.Errorf("cannot register telemetry job: %w", err)
 	}
 
-	if cfg.ProductTelemetryConfig.Enabled {
-		dataCollector := telemetry.NewDataCollectorImpl(telemetry.DataCollectorConfig{
-			K8sClientReader:     mgr.GetAPIReader(),
-			GraphGetter:         processor,
-			ConfigurationGetter: eventHandler,
-			Version:             cfg.GatewayPodConfig.Version,
-			PodNSName: types.NamespacedName{
-				Namespace: cfg.GatewayPodConfig.Namespace,
-				Name:      cfg.GatewayPodConfig.Name,
-			},
-			ImageSource:               cfg.ImageSource,
-			Flags:                     cfg.Flags,
-			NginxOneConsoleConnection: cfg.NginxOneConsoleTelemetryConfig.DataplaneKeySecretName != "",
-		})
-
-		job, err := createTelemetryJob(cfg, dataCollector, healthChecker.getReadyCh())
-		if err != nil {
-			return fmt.Errorf("cannot create telemetry job: %w", err)
-		}
-
-		if err = mgr.Add(job); err != nil {
-			return fmt.Errorf("cannot register telemetry job: %w", err)
-		}
-	}
-
-	cfg.Logger.Info("Starting manager")
-	go func() {
-		<-ctx.Done()
-		cfg.Logger.Info("Shutting down")
-	}()
-
-	return mgr.Start(ctx)
+	return nil
 }
 
 func createPolicyManager(
@@ -357,6 +489,10 @@ func createPolicyManager(
 		{
 			GVK:       mustExtractGVK(&ngfAPIv1alpha1.RateLimitPolicy{}),
 			Validator: ratelimit.NewValidator(validator),
+		},
+		{
+			GVK:       mustExtractGVK(&ngfAPIv1alpha1.WAFPolicy{}),
+			Validator: waf.NewValidator(),
 		},
 	}
 
@@ -543,6 +679,113 @@ func filterControllersByCRDExistence(
 	return filtered, discoveredCRDs, nil
 }
 
+// featureFlagControllerCfgs returns controller configs that are gated behind feature flags.
+func featureFlagControllerCfgs(cfg config.Config) []ctlrCfg {
+	var cfgs []ctlrCfg
+
+	// APPolicy/APLogConf - register only when PLM storage is configured. These resources are
+	// reconciled exclusively to support PLM-sourced WAF policies, and their RBAC in the Helm
+	// chart is gated on the same condition, so registering them unconditionally would cause
+	// the controller to fail to list/watch them on clusters with App Protect CRDs installed
+	// but no PLM configuration.
+	if cfg.PLMStorageConfig != nil {
+		cfgs = append(cfgs,
+			ctlrCfg{
+				objectType: kinds.NewAPPolicyObject(),
+				options: []controller.Option{
+					controller.WithK8sPredicate(predicate.PLMStatusChangedPredicate{}),
+				},
+				requireCRDCheck: true,
+				crdGVK: &schema.GroupVersionKind{
+					Group:   wafv1.Group,
+					Version: wafv1.Version,
+					Kind:    kinds.APPolicy,
+				},
+			},
+			ctlrCfg{
+				objectType: kinds.NewAPLogConfObject(),
+				options: []controller.Option{
+					controller.WithK8sPredicate(predicate.PLMStatusChangedPredicate{}),
+				},
+				requireCRDCheck: true,
+				crdGVK: &schema.GroupVersionKind{
+					Group:   wafv1.Group,
+					Version: wafv1.Version,
+					Kind:    kinds.APLogConf,
+				},
+			},
+		)
+	}
+
+	if cfg.ExperimentalFeatures {
+		cfgs = append(cfgs,
+			ctlrCfg{
+				objectType: &gatewayv1alpha2.TCPRoute{},
+				options: []controller.Option{
+					controller.WithK8sPredicate(k8spredicate.GenerationChangedPredicate{}),
+				},
+				requireCRDCheck: true,
+				crdGVK: &schema.GroupVersionKind{
+					Group:   "gateway.networking.k8s.io",
+					Version: "v1alpha2",
+					Kind:    "TCPRoute",
+				},
+			},
+			ctlrCfg{
+				objectType: &gatewayv1alpha2.UDPRoute{},
+				options: []controller.Option{
+					controller.WithK8sPredicate(k8spredicate.GenerationChangedPredicate{}),
+				},
+				requireCRDCheck: true,
+				crdGVK: &schema.GroupVersionKind{
+					Group:   "gateway.networking.k8s.io",
+					Version: "v1alpha2",
+					Kind:    "UDPRoute",
+				},
+			},
+		)
+	}
+
+	if cfg.InferenceExtension {
+		cfgs = append(cfgs,
+			ctlrCfg{
+				objectType: &inference.InferencePool{},
+				options: []controller.Option{
+					controller.WithK8sPredicate(k8spredicate.GenerationChangedPredicate{}),
+				},
+				// Skip CRD check for InferenceExtension as it uses a non-standard API group (x-k8s.io)
+				// that may not be properly discoverable via the standard API discovery mechanism.
+				// The InferenceExtension flag itself controls whether this controller is enabled.
+				requireCRDCheck: false,
+			},
+		)
+	}
+
+	if cfg.SnippetsFilters || cfg.Snippets {
+		cfgs = append(cfgs,
+			ctlrCfg{
+				objectType: &ngfAPIv1alpha1.SnippetsFilter{},
+				options: []controller.Option{
+					controller.WithK8sPredicate(k8spredicate.GenerationChangedPredicate{}),
+				},
+			},
+		)
+	}
+
+	if cfg.Snippets {
+		cfgs = append(cfgs,
+			ctlrCfg{
+				objectType: &ngfAPIv1alpha1.SnippetsPolicy{},
+				options: []controller.Option{
+					controller.WithK8sPredicate(k8spredicate.GenerationChangedPredicate{}),
+				},
+			},
+		)
+	}
+
+	return cfgs
+}
+
 func registerControllers(
 	ctx context.Context,
 	cfg config.Config,
@@ -684,7 +927,15 @@ func registerControllers(
 				controller.WithK8sPredicate(k8spredicate.GenerationChangedPredicate{}),
 			},
 		},
+		{
+			objectType: &ngfAPIv1alpha1.WAFPolicy{},
+			options: []controller.Option{
+				controller.WithK8sPredicate(k8spredicate.GenerationChangedPredicate{}),
+			},
+		},
 	}
+
+	controllerRegCfgs = append(controllerRegCfgs, featureFlagControllerCfgs(cfg)...)
 
 	// BackendTLSPolicy/TLSRoute v1 - conditionally register if CRD exists
 	controllerRegCfgs = append(controllerRegCfgs,
@@ -712,53 +963,19 @@ func registerControllers(
 				Kind:    "TLSRoute",
 			},
 		},
+		ctlrCfg{
+			objectType: &gatewayv1.ListenerSet{},
+			options: []controller.Option{
+				controller.WithK8sPredicate(k8spredicate.GenerationChangedPredicate{}),
+			},
+			requireCRDCheck: true,
+			crdGVK: &schema.GroupVersionKind{
+				Group:   "gateway.networking.k8s.io",
+				Version: "v1",
+				Kind:    "ListenerSet",
+			},
+		},
 	)
-
-	if cfg.ExperimentalFeatures {
-		gwExpFeatures := []ctlrCfg{
-			{
-				objectType: &gatewayv1alpha2.TCPRoute{},
-				options: []controller.Option{
-					controller.WithK8sPredicate(k8spredicate.GenerationChangedPredicate{}),
-				},
-				requireCRDCheck: true,
-				crdGVK: &schema.GroupVersionKind{
-					Group:   "gateway.networking.k8s.io",
-					Version: "v1alpha2",
-					Kind:    "TCPRoute",
-				},
-			},
-			{
-				objectType: &gatewayv1alpha2.UDPRoute{},
-				options: []controller.Option{
-					controller.WithK8sPredicate(k8spredicate.GenerationChangedPredicate{}),
-				},
-				requireCRDCheck: true,
-				crdGVK: &schema.GroupVersionKind{
-					Group:   "gateway.networking.k8s.io",
-					Version: "v1alpha2",
-					Kind:    "UDPRoute",
-				},
-			},
-		}
-		controllerRegCfgs = append(controllerRegCfgs, gwExpFeatures...)
-	}
-
-	if cfg.InferenceExtension {
-		inferenceExt := []ctlrCfg{
-			{
-				objectType: &inference.InferencePool{},
-				options: []controller.Option{
-					controller.WithK8sPredicate(k8spredicate.GenerationChangedPredicate{}),
-				},
-				// Skip CRD check for InferenceExtension as it uses a non-standard API group (x-k8s.io)
-				// that may not be properly discoverable via the standard API discovery mechanism.
-				// The InferenceExtension flag itself controls whether this controller is enabled.
-				requireCRDCheck: false,
-			},
-		}
-		controllerRegCfgs = append(controllerRegCfgs, inferenceExt...)
-	}
 
 	if cfg.ConfigName != "" {
 		controllerRegCfgs = append(controllerRegCfgs,
@@ -778,28 +995,6 @@ func registerControllers(
 		); err != nil {
 			return nil, fmt.Errorf("error setting initial control plane configuration: %w", err)
 		}
-	}
-
-	if cfg.SnippetsFilters || cfg.Snippets {
-		controllerRegCfgs = append(controllerRegCfgs,
-			ctlrCfg{
-				objectType: &ngfAPIv1alpha1.SnippetsFilter{},
-				options: []controller.Option{
-					controller.WithK8sPredicate(k8spredicate.GenerationChangedPredicate{}),
-				},
-			},
-		)
-	}
-
-	if cfg.Snippets {
-		controllerRegCfgs = append(controllerRegCfgs,
-			ctlrCfg{
-				objectType: &ngfAPIv1alpha1.SnippetsPolicy{},
-				options: []controller.Option{
-					controller.WithK8sPredicate(k8spredicate.GenerationChangedPredicate{}),
-				},
-			},
-		)
 	}
 
 	// Filter controllers based on CRD existence
@@ -933,18 +1128,98 @@ func validateSecret(reader client.Reader, nsName types.NamespacedName, fields ..
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
 
-	var secret apiv1.Secret
-	if err := reader.Get(ctx, nsName, &secret); err != nil {
-		return fmt.Errorf("error getting %q Secret: %w", nsName.Name, err)
+	secret, err := getSecret(ctx, reader, nsName)
+	if err != nil {
+		return err
 	}
 
+	return validateSecretData(secret, fields...)
+}
+
+func getSecret(
+	ctx context.Context,
+	reader client.Reader,
+	nsName types.NamespacedName,
+) (*apiv1.Secret, error) {
+	var secret apiv1.Secret
+	if err := reader.Get(ctx, nsName, &secret); err != nil {
+		return nil, fmt.Errorf("error getting %q Secret: %w", nsName.Name, err)
+	}
+
+	return &secret, nil
+}
+
+func validateSecretData(secret *apiv1.Secret, fields ...string) error {
 	for _, field := range fields {
 		if _, ok := secret.Data[field]; !ok {
-			return fmt.Errorf("secret %q does not have expected field %q", nsName.Name, field)
+			return fmt.Errorf("secret %q does not have expected field %q", secret.Name, field)
 		}
 	}
 
 	return nil
+}
+
+// createWAFFetcher creates an HTTP fetcher for WAF policy bundles.
+func createWAFFetcher(logger logr.Logger) fetch.Fetcher {
+	return fetch.NewHTTPFetcher(logger)
+}
+
+// createPLMFetcher creates an S3 fetcher for PLM policy bundles and returns the secret names
+// that should be tracked for IsReferenced. Returns (nil, nil) if PLM is not configured.
+func createPLMFetcher(cfg config.Config) (*s3fetch.Fetcher, map[types.NamespacedName][]graph.PLMRole) {
+	if cfg.PLMStorageConfig == nil {
+		return nil, nil
+	}
+
+	fetcher := s3fetch.NewFetcher(
+		cfg.Logger.WithName("plmFetcher"),
+		cfg.PLMStorageConfig.URL,
+		cfg.PLMStorageConfig.SkipVerify,
+	)
+
+	secretNames := buildPLMSecretNames(cfg.PLMStorageConfig, cfg.GatewayPodConfig.Namespace)
+
+	return fetcher, secretNames
+}
+
+// buildPLMSecretNames builds a map of NamespacedName→PLMRole for PLM storage secrets.
+// Secret names may be in "namespace/name" format for cross-namespace references,
+// or plain "name" format which defaults to the provided namespace.
+func buildPLMSecretNames(
+	plmCfg *config.PLMStorageConfig,
+	defaultNamespace string,
+) map[types.NamespacedName][]graph.PLMRole {
+	if plmCfg == nil {
+		return nil
+	}
+
+	names := make(map[types.NamespacedName][]graph.PLMRole)
+
+	addSecret := func(value string, role graph.PLMRole) {
+		if value != "" {
+			ns, name := parsePLMSecretName(value, defaultNamespace)
+			nsName := types.NamespacedName{Namespace: ns, Name: name}
+			if !slices.Contains(names[nsName], role) {
+				names[nsName] = append(names[nsName], role)
+			}
+		}
+	}
+
+	addSecret(plmCfg.CredentialsSecretName, graph.PLMRoleCredentials)
+	addSecret(plmCfg.CASecretName, graph.PLMRoleCA)
+	addSecret(plmCfg.ClientSSLSecretName, graph.PLMRoleClientSSL)
+
+	return names
+}
+
+// parsePLMSecretName splits a "namespace/name" string into its parts.
+// If no namespace prefix is present, the provided defaultNamespace is used.
+func parsePLMSecretName(value, defaultNamespace string) (namespace, name string) {
+	parts := strings.SplitN(value, "/", 2)
+	if len(parts) == 2 {
+		return parts[0], parts[1]
+	}
+	return defaultNamespace, value
 }
 
 // 10 min jitter is enough per telemetry destination recommendation
@@ -1030,7 +1305,16 @@ func prepareFirstEventBatchPreparerArgs(
 		&ngfAPIv1alpha1.UpstreamSettingsPolicyList{},
 		&ngfAPIv1alpha1.AuthenticationFilterList{},
 		&ngfAPIv1alpha1.RateLimitPolicyList{},
+		&ngfAPIv1alpha1.WAFPolicyList{},
 		partialObjectMetadataList,
+	}
+
+	if discoveredCRDs[kinds.APPolicy] {
+		objectLists = append(objectLists, kinds.NewAPPolicyList())
+	}
+
+	if discoveredCRDs[kinds.APLogConf] {
+		objectLists = append(objectLists, kinds.NewAPLogConfList())
 	}
 
 	// Add ReferenceGrant list - use v1 if available, otherwise fall back to v1beta1
@@ -1043,6 +1327,10 @@ func prepareFirstEventBatchPreparerArgs(
 	// Add object lists for CRDs that were discovered
 	if discoveredCRDs["BackendTLSPolicy"] {
 		objectLists = append(objectLists, &gatewayv1.BackendTLSPolicyList{})
+	}
+
+	if discoveredCRDs["ListenerSet"] {
+		objectLists = append(objectLists, &gatewayv1.ListenerSetList{})
 	}
 
 	if cfg.ExperimentalFeatures {

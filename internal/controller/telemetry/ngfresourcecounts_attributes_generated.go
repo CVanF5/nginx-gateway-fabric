@@ -34,6 +34,17 @@ func (d *NGFResourceCounts) Attributes() []attribute.KeyValue {
 	attrs = append(attrs, attribute.Int64("SnippetsPolicyCount", d.SnippetsPolicyCount))
 	attrs = append(attrs, attribute.Int64("TCPRouteCount", d.TCPRouteCount))
 	attrs = append(attrs, attribute.Int64("UDPRouteCount", d.UDPRouteCount))
+	attrs = append(attrs, attribute.Int64("InferencePoolCount", d.InferencePoolCount))
+	attrs = append(attrs, attribute.Int64("GatewayAttachedProxySettingsPolicyCount", d.GatewayAttachedProxySettingsPolicyCount))
+	attrs = append(attrs, attribute.Int64("RouteAttachedProxySettingsPolicyCount", d.RouteAttachedProxySettingsPolicyCount))
+	attrs = append(attrs, attribute.Int64("GatewayAttachedWAFPolicyCount", d.GatewayAttachedWAFPolicyCount))
+	attrs = append(attrs, attribute.Int64("RouteAttachedWAFPolicyCount", d.RouteAttachedWAFPolicyCount))
+	attrs = append(attrs, attribute.Int64("WAFEnabledGatewayCount", d.WAFEnabledGatewayCount))
+	attrs = append(attrs, attribute.Int64("HTTPWAFPolicyCount", d.HTTPWAFPolicyCount))
+	attrs = append(attrs, attribute.Int64("NIMWAFPolicyCount", d.NIMWAFPolicyCount))
+	attrs = append(attrs, attribute.Int64("N1CWAFPolicyCount", d.N1CWAFPolicyCount))
+	attrs = append(attrs, attribute.Int64("PLMWAFPolicyCount", d.PLMWAFPolicyCount))
+	attrs = append(attrs, attribute.Int64("ListenerSetCount", d.ListenerSetCount))
 
 	return attrs
 }

@@ -388,6 +388,7 @@ func TestBuildGateway(t *testing.T) {
 		allowedListeners *v1.AllowedListeners
 		TLS              *v1.GatewayTLSConfig
 		name             string
+		defaultScope     v1.GatewayDefaultScope
 		listeners        []v1.Listener
 		addresses        []v1.GatewaySpecAddress
 	}
@@ -406,6 +407,7 @@ func TestBuildGateway(t *testing.T) {
 				Addresses:        cfg.addresses,
 				AllowedListeners: cfg.allowedListeners,
 				TLS:              cfg.TLS,
+				DefaultScope:     cfg.defaultScope,
 			},
 		}
 
@@ -1736,10 +1738,10 @@ func TestBuildGateway(t *testing.T) {
 		{
 			name: "One unsupported field + supported fields (valid)",
 			gateway: createGateway(gatewayCfg{
-				name:             "gateway-valid-np",
-				listeners:        []v1.Listener{foo80Listener1},
-				ref:              validGwNpRef,
-				allowedListeners: &v1.AllowedListeners{},
+				name:         "gateway-valid-np",
+				listeners:    []v1.Listener{foo80Listener1},
+				ref:          validGwNpRef,
+				defaultScope: v1.GatewayDefaultScopeAll,
 			}),
 			gatewayClass: validGCWithNp,
 			expected: map[types.NamespacedName]*Gateway{
@@ -1777,7 +1779,7 @@ func TestBuildGateway(t *testing.T) {
 						},
 					},
 					Conditions: []conditions.Condition{
-						conditions.NewGatewayAcceptedUnsupportedField("AllowedListeners"),
+						conditions.NewGatewayAcceptedUnsupportedField("spec.defaultScope: Forbidden: DefaultScope"),
 						conditions.NewGatewayResolvedRefs(),
 					},
 				},
@@ -1793,6 +1795,7 @@ func TestBuildGateway(t *testing.T) {
 					Name: "invalid-ref",
 				},
 				allowedListeners: &v1.AllowedListeners{},
+				defaultScope:     v1.GatewayDefaultScopeAll,
 			}),
 			gatewayClass: validGCWithNp,
 			expected: map[types.NamespacedName]*Gateway{
@@ -1819,7 +1822,7 @@ func TestBuildGateway(t *testing.T) {
 						IPFamily: helpers.GetPointer(ngfAPIv1alpha2.Dual),
 					},
 					Conditions: []conditions.Condition{
-						conditions.NewGatewayAcceptedUnsupportedField("AllowedListeners"),
+						conditions.NewGatewayAcceptedUnsupportedField("spec.defaultScope: Forbidden: DefaultScope"),
 						conditions.NewGatewayInvalidParameters(
 							"Spec.infrastructure.parametersRef.kind: Unsupported value: \"wrong-kind\": supported values: \"NginxProxy\"",
 						),
@@ -1829,6 +1832,124 @@ func TestBuildGateway(t *testing.T) {
 					},
 				},
 			},
+		},
+		{
+			gateway: createGateway(
+				gatewayCfg{
+					name:      "gateway-with-allowed-listeners",
+					listeners: []v1.Listener{foo80Listener1},
+					allowedListeners: &v1.AllowedListeners{
+						Namespaces: &v1.ListenerNamespaces{
+							From: helpers.GetPointer(v1.NamespacesFromSelector),
+							Selector: &metav1.LabelSelector{
+								MatchLabels: map[string]string{
+									"listenersets": "allowed",
+								},
+							},
+						},
+					},
+				},
+			),
+			gatewayClass: validGC,
+			expected: map[types.NamespacedName]*Gateway{
+				{Namespace: "test", Name: "gateway-with-allowed-listeners"}: {
+					Source: getLastCreatedGateway(),
+					Listeners: []*Listener{
+						{
+							Name:           "foo-80-1",
+							GatewayName:    client.ObjectKeyFromObject(getLastCreatedGateway()),
+							Source:         foo80Listener1,
+							Valid:          true,
+							Attachable:     true,
+							Routes:         map[RouteKey]*L7Route{},
+							L4Routes:       map[L4RouteKey]*L4Route{},
+							SupportedKinds: supportedKindsForListeners,
+						},
+					},
+					DeploymentName: types.NamespacedName{
+						Namespace: "test",
+						Name:      controller.CreateNginxResourceName("gateway-with-allowed-listeners", gcName),
+					},
+					Valid: true,
+					ListenerNamespaces: &v1.ListenerNamespaces{
+						From: helpers.GetPointer(v1.NamespacesFromSelector),
+						Selector: &metav1.LabelSelector{
+							MatchLabels: map[string]string{
+								"listenersets": "allowed",
+							},
+						},
+					},
+				},
+			},
+			name: "gateway with allowed listeners configuration",
+		},
+		{
+			gateway: createGateway(gatewayCfg{
+				name: "gateway-unique-listener-conflicts",
+				listeners: []v1.Listener{
+					{
+						Name:     "http-80-1",
+						Port:     80,
+						Protocol: v1.HTTPProtocolType,
+						Hostname: helpers.GetPointer[v1.Hostname]("example.com"),
+					},
+					{
+						Name:     "http-80-2",
+						Port:     80,
+						Protocol: v1.HTTPProtocolType,
+						Hostname: helpers.GetPointer[v1.Hostname]("example.com"),
+					},
+				},
+			}),
+			gatewayClass: validGC,
+			expected: map[types.NamespacedName]*Gateway{
+				{Namespace: "test", Name: "gateway-unique-listener-conflicts"}: {
+					Source: getLastCreatedGateway(),
+					Listeners: []*Listener{
+						{
+							Name:            "http-80-1",
+							GatewayName:     client.ObjectKeyFromObject(getLastCreatedGateway()),
+							ListenerSetName: types.NamespacedName{},
+							Source: v1.Listener{
+								Name:     "http-80-1",
+								Port:     80,
+								Protocol: v1.HTTPProtocolType,
+								Hostname: helpers.GetPointer[v1.Hostname]("example.com"),
+							},
+							Valid:          true, // First listener stays valid
+							Attachable:     true,
+							Routes:         map[RouteKey]*L7Route{},
+							L4Routes:       map[L4RouteKey]*L4Route{},
+							SupportedKinds: supportedKindsForListeners,
+						},
+						{
+							Name:            "http-80-2",
+							GatewayName:     client.ObjectKeyFromObject(getLastCreatedGateway()),
+							ListenerSetName: types.NamespacedName{},
+							Source: v1.Listener{
+								Name:     "http-80-2",
+								Port:     80,
+								Protocol: v1.HTTPProtocolType,
+								Hostname: helpers.GetPointer[v1.Hostname]("example.com"),
+							},
+							Valid:      false, // Second listener becomes invalid
+							Attachable: true,
+							Routes:     map[RouteKey]*L7Route{},
+							L4Routes:   map[L4RouteKey]*L4Route{},
+							Conditions: conditions.NewListenerHostnameConflict(
+								"Multiple listeners with the same port 80 and protocol HTTP " +
+									"have overlapping hostnames"),
+							SupportedKinds: supportedKindsForListeners,
+						},
+					},
+					DeploymentName: types.NamespacedName{
+						Namespace: "test",
+						Name:      controller.CreateNginxResourceName("gateway-unique-listener-conflicts", gcName),
+					},
+					Valid: true,
+				},
+			},
+			name: "duplicate listeners test uniqueListenerConflictResolver behavior",
 		},
 	}
 
@@ -1859,6 +1980,24 @@ func TestBuildGateway(t *testing.T) {
 			g := NewWithT(t)
 			resolver := newReferenceGrantResolver(test.refGrants)
 			result := buildGateways(test.gateway, resourceResolver, test.gatewayClass, resolver, nginxProxies)
+
+			// Verify ListenerFactory field separately since it's a complex internal struct
+			// Directly comparing the ListenerFactory internal fields is unnecessary as it is tested
+			// in the test file of where the ListenerFactory is defined.
+			for gwKey, expectedGw := range test.expected {
+				actualGw, exists := result[gwKey]
+				g.Expect(exists).To(BeTrue())
+
+				if expectedGw.Valid {
+					g.Expect(actualGw.ListenerFactory).ToNot(BeNil())
+				} else {
+					g.Expect(actualGw.ListenerFactory).To(BeNil())
+				}
+
+				// Clear ListenerFactory from actual result for struct comparison
+				actualGw.ListenerFactory = nil
+			}
+
 			g.Expect(helpers.Diff(test.expected, result)).To(BeEmpty())
 		})
 	}
@@ -1975,11 +2114,24 @@ func TestValidateGatewayParametersRef(t *testing.T) {
 func TestGetReferencedSnippetsFilters(t *testing.T) {
 	t.Parallel()
 
+	listenerSetNsName := types.NamespacedName{Namespace: "gateway-ns", Name: "test-listenerset"}
+
 	gw := &Gateway{
 		Source: &v1.Gateway{
 			ObjectMeta: metav1.ObjectMeta{
 				Namespace: "gateway-ns",
 				Name:      "test-gateway",
+			},
+		},
+		AttachedListenerSets: map[types.NamespacedName]*ListenerSet{
+			listenerSetNsName: {
+				Source: &v1.ListenerSet{
+					ObjectMeta: metav1.ObjectMeta{
+						Namespace: "gateway-ns",
+						Name:      "test-listenerset",
+					},
+				},
+				Valid: true,
 			},
 		},
 	}
@@ -2014,6 +2166,16 @@ func TestGetReferencedSnippetsFilters(t *testing.T) {
 		Valid: false,
 	}
 
+	sf4 := &SnippetsFilter{
+		Source: &ngfAPIv1alpha1.SnippetsFilter{
+			ObjectMeta: metav1.ObjectMeta{
+				Namespace: "app4",
+				Name:      "listenerset-route-filter",
+			},
+		},
+		Valid: true,
+	}
+
 	routeAttachedToGateway := &L7Route{
 		Source: &v1.HTTPRoute{
 			ObjectMeta: metav1.ObjectMeta{
@@ -2024,12 +2186,8 @@ func TestGetReferencedSnippetsFilters(t *testing.T) {
 		Valid: true,
 		ParentRefs: []ParentRef{
 			{
-				Gateway: &ParentRefGateway{
-					NamespacedName: types.NamespacedName{
-						Namespace: "gateway-ns",
-						Name:      "test-gateway",
-					},
-				},
+				Kind:           kinds.Gateway,
+				NamespacedName: types.NamespacedName{Namespace: "gateway-ns", Name: "test-gateway"},
 			},
 		},
 		Spec: L7RouteSpec{
@@ -2062,12 +2220,8 @@ func TestGetReferencedSnippetsFilters(t *testing.T) {
 		Valid: true,
 		ParentRefs: []ParentRef{
 			{
-				Gateway: &ParentRefGateway{
-					NamespacedName: types.NamespacedName{
-						Namespace: "other-gateway-ns",
-						Name:      "other-gateway",
-					},
-				},
+				Kind:           kinds.Gateway,
+				NamespacedName: types.NamespacedName{Namespace: "other-gateway-ns", Name: "other-gateway"},
 			},
 		},
 		Spec: L7RouteSpec{
@@ -2100,12 +2254,8 @@ func TestGetReferencedSnippetsFilters(t *testing.T) {
 		Valid: true,
 		ParentRefs: []ParentRef{
 			{
-				Gateway: &ParentRefGateway{
-					NamespacedName: types.NamespacedName{
-						Namespace: "gateway-ns",
-						Name:      "test-gateway",
-					},
-				},
+				Kind:           kinds.Gateway,
+				NamespacedName: types.NamespacedName{Namespace: "gateway-ns", Name: "test-gateway"},
 			},
 		},
 		Spec: L7RouteSpec{
@@ -2128,6 +2278,41 @@ func TestGetReferencedSnippetsFilters(t *testing.T) {
 		},
 	}
 
+	// Route attached via ListenerSet (not directly to the Gateway).
+	routeAttachedViaListenerSet := &L7Route{
+		Source: &v1.HTTPRoute{
+			ObjectMeta: metav1.ObjectMeta{
+				Namespace: "app4",
+				Name:      "listenerset-route",
+			},
+		},
+		Valid: true,
+		ParentRefs: []ParentRef{
+			{
+				Kind:           kinds.ListenerSet,
+				NamespacedName: listenerSetNsName,
+			},
+		},
+		Spec: L7RouteSpec{
+			Rules: []RouteRule{
+				{
+					Filters: RouteRuleFilters{
+						Valid: true,
+						Filters: []Filter{
+							{
+								FilterType: FilterExtensionRef,
+								ResolvedExtensionRef: &ExtensionRefFilter{
+									SnippetsFilter: sf4,
+									Valid:          true,
+								},
+							},
+						},
+					},
+				},
+			},
+		},
+	}
+
 	routes := map[RouteKey]*L7Route{
 		{
 			NamespacedName: types.NamespacedName{Namespace: "app1", Name: "attached-route"},
@@ -2141,21 +2326,30 @@ func TestGetReferencedSnippetsFilters(t *testing.T) {
 			NamespacedName: types.NamespacedName{Namespace: "app3", Name: "route-with-invalid-filter"},
 			RouteType:      RouteTypeHTTP,
 		}: routeWithInvalidFilter,
+		{
+			NamespacedName: types.NamespacedName{Namespace: "app4", Name: "listenerset-route"},
+			RouteType:      RouteTypeHTTP,
+		}: routeAttachedViaListenerSet,
 	}
 
 	allSnippetsFilters := map[types.NamespacedName]*SnippetsFilter{
-		{Namespace: "app1", Name: "app1-logging"}:   sf1,
-		{Namespace: "app2", Name: "app2-logging"}:   sf2,
-		{Namespace: "app3", Name: "invalid-filter"}: sf3Invalid,
+		{Namespace: "app1", Name: "app1-logging"}:             sf1,
+		{Namespace: "app2", Name: "app2-logging"}:             sf2,
+		{Namespace: "app3", Name: "invalid-filter"}:           sf3Invalid,
+		{Namespace: "app4", Name: "listenerset-route-filter"}: sf4,
 	}
 
 	g := NewWithT(t)
 
 	result := gw.GetReferencedSnippetsFilters(routes, allSnippetsFilters)
 
-	// Should only include sf1 (valid filter from route attached to this gateway)
+	// Should include sf1 (valid filter from route attached directly to gateway)
+	// and sf4 (valid filter from route attached via ListenerSet).
+	// sf2 is excluded (route not attached to this gateway).
+	// sf3Invalid is excluded (invalid filter).
 	expectedResult := map[types.NamespacedName]*SnippetsFilter{
-		{Namespace: "app1", Name: "app1-logging"}: sf1,
+		{Namespace: "app1", Name: "app1-logging"}:             sf1,
+		{Namespace: "app4", Name: "listenerset-route-filter"}: sf4,
 	}
 
 	g.Expect(result).To(Equal(expectedResult))
@@ -2172,11 +2366,24 @@ func TestGetReferencedSnippetsFilters(t *testing.T) {
 func TestGetReferencedRateLimitPolicies(t *testing.T) {
 	t.Parallel()
 
+	listenerSetNsName := types.NamespacedName{Namespace: "gateway-ns", Name: "test-listenerset"}
+
 	gw := &Gateway{
 		Source: &v1.Gateway{
 			ObjectMeta: metav1.ObjectMeta{
 				Namespace: "gateway-ns",
 				Name:      "test-gateway",
+			},
+		},
+		AttachedListenerSets: map[types.NamespacedName]*ListenerSet{
+			listenerSetNsName: {
+				Source: &v1.ListenerSet{
+					ObjectMeta: metav1.ObjectMeta{
+						Namespace: "gateway-ns",
+						Name:      "test-listenerset",
+					},
+				},
+				Valid: true,
 			},
 		},
 	}
@@ -2301,6 +2508,23 @@ func TestGetReferencedRateLimitPolicies(t *testing.T) {
 		},
 	}
 
+	// Policy targeting a route that is attached via ListenerSet.
+	rlpListenerSetRoute := &Policy{
+		Source: &ngfAPIv1alpha1.RateLimitPolicy{
+			ObjectMeta: metav1.ObjectMeta{
+				Namespace: "app8",
+				Name:      "listenerset-route-rate-limit",
+			},
+		},
+		Valid: true,
+		TargetRefs: []PolicyTargetRef{
+			{
+				Kind:   kinds.HTTPRoute,
+				Nsname: types.NamespacedName{Namespace: "app8", Name: "listenerset-route"},
+			},
+		},
+	}
+
 	routeAttachedToGateway := &L7Route{
 		Source: &v1.HTTPRoute{
 			ObjectMeta: metav1.ObjectMeta{
@@ -2311,12 +2535,8 @@ func TestGetReferencedRateLimitPolicies(t *testing.T) {
 		Valid: true,
 		ParentRefs: []ParentRef{
 			{
-				Gateway: &ParentRefGateway{
-					NamespacedName: types.NamespacedName{
-						Namespace: "gateway-ns",
-						Name:      "test-gateway",
-					},
-				},
+				Kind:           kinds.Gateway,
+				NamespacedName: types.NamespacedName{Namespace: "gateway-ns", Name: "test-gateway"},
 			},
 		},
 	}
@@ -2331,12 +2551,8 @@ func TestGetReferencedRateLimitPolicies(t *testing.T) {
 		Valid: true,
 		ParentRefs: []ParentRef{
 			{
-				Gateway: &ParentRefGateway{
-					NamespacedName: types.NamespacedName{
-						Namespace: "gateway-ns",
-						Name:      "test-gateway",
-					},
-				},
+				Kind:           kinds.Gateway,
+				NamespacedName: types.NamespacedName{Namespace: "gateway-ns", Name: "test-gateway"},
 			},
 		},
 	}
@@ -2351,12 +2567,25 @@ func TestGetReferencedRateLimitPolicies(t *testing.T) {
 		Valid: true,
 		ParentRefs: []ParentRef{
 			{
-				Gateway: &ParentRefGateway{
-					NamespacedName: types.NamespacedName{
-						Namespace: "secondary-gateway-ns",
-						Name:      "secondary-gateway",
-					},
-				},
+				Kind:           kinds.Gateway,
+				NamespacedName: types.NamespacedName{Namespace: "secondary-gateway-ns", Name: "secondary-gateway"},
+			},
+		},
+	}
+
+	// Route attached via ListenerSet (not directly to the Gateway).
+	routeAttachedViaListenerSet := &L7Route{
+		Source: &v1.HTTPRoute{
+			ObjectMeta: metav1.ObjectMeta{
+				Namespace: "app8",
+				Name:      "listenerset-route",
+			},
+		},
+		Valid: true,
+		ParentRefs: []ParentRef{
+			{
+				Kind:           kinds.ListenerSet,
+				NamespacedName: listenerSetNsName,
 			},
 		},
 	}
@@ -2374,6 +2603,10 @@ func TestGetReferencedRateLimitPolicies(t *testing.T) {
 			NamespacedName: types.NamespacedName{Namespace: "app2", Name: "not-attached-route"},
 			RouteType:      RouteTypeHTTP,
 		}: routeNotAttachedToGateway,
+		{
+			NamespacedName: types.NamespacedName{Namespace: "app8", Name: "listenerset-route"},
+			RouteType:      RouteTypeHTTP,
+		}: routeAttachedViaListenerSet,
 	}
 
 	allPolicies := map[PolicyKey]*Policy{
@@ -2418,14 +2651,19 @@ func TestGetReferencedRateLimitPolicies(t *testing.T) {
 				},
 			},
 		},
+		{
+			NsName: types.NamespacedName{Namespace: "app8", Name: "listenerset-route-rate-limit"},
+			GVK:    schema.GroupVersionKind{Kind: kinds.RateLimitPolicy},
+		}: rlpListenerSetRoute,
 	}
 
 	g := NewWithT(t)
 
 	result := gw.GetReferencedRateLimitPolicies(routes, allPolicies)
 
-	// Should only include rlp1 (valid RateLimitPolicy targeting attached route, not gateway)
-	// and rlpGRPC (valid RateLimitPolicy targeting attached GRPC route)
+	// Should include rlp1 (valid RateLimitPolicy targeting attached route, not gateway),
+	// rlpGRPC (valid RateLimitPolicy targeting attached GRPC route), and
+	// rlpListenerSetRoute (valid RateLimitPolicy targeting route attached via ListenerSet).
 	expectedResult := map[PolicyKey]*Policy{
 		{
 			NsName: types.NamespacedName{Namespace: "app1", Name: "app1-rate-limit"},
@@ -2435,6 +2673,10 @@ func TestGetReferencedRateLimitPolicies(t *testing.T) {
 			NsName: types.NamespacedName{Namespace: "app5", Name: "grpc-rate-limit"},
 			GVK:    schema.GroupVersionKind{Kind: kinds.RateLimitPolicy},
 		}: rlpGRPC,
+		{
+			NsName: types.NamespacedName{Namespace: "app8", Name: "listenerset-route-rate-limit"},
+			GVK:    schema.GroupVersionKind{Kind: kinds.RateLimitPolicy},
+		}: rlpListenerSetRoute,
 	}
 
 	g.Expect(result).To(Equal(expectedResult))
@@ -2476,14 +2718,14 @@ func TestValidateUnsupportedGatewayFields(t *testing.T) {
 			expectedConds: nil,
 		},
 		{
-			name: "One unsupported field: AllowedListeners",
+			name: "One unsupported field: defaultScope",
 			gateway: &v1.Gateway{
 				Spec: v1.GatewaySpec{
-					AllowedListeners: &v1.AllowedListeners{},
+					DefaultScope: v1.GatewayDefaultScopeAll,
 				},
 			},
 			expectedConds: []conditions.Condition{
-				conditions.NewGatewayAcceptedUnsupportedField("AllowedListeners"),
+				conditions.NewGatewayAcceptedUnsupportedField("spec.defaultScope: Forbidden: DefaultScope"),
 			},
 		},
 	}
@@ -2751,6 +2993,24 @@ func TestGateway_BackendTLSConfig(t *testing.T) {
 
 			refGrantResolver := newReferenceGrantResolver(test.refGrants)
 			gateways := buildGateways(test.gw, resourceResolver, validGC, refGrantResolver, nil)
+
+			// Verify ListenerFactory field separately since it's a complex internal struct
+			// Directly comparing the ListenerFactory internal fields is unnecessary as it is tested
+			// in the test file of where the ListenerFactory is defined.
+			for gwKey, expectedGw := range test.expected {
+				actualGw, exists := gateways[gwKey]
+				g.Expect(exists).To(BeTrue())
+
+				if expectedGw.Valid {
+					g.Expect(actualGw.ListenerFactory).ToNot(BeNil())
+				} else {
+					g.Expect(actualGw.ListenerFactory).To(BeNil())
+				}
+
+				// Clear ListenerFactory from actual result for struct comparison
+				actualGw.ListenerFactory = nil
+			}
+
 			g.Expect(helpers.Diff(test.expected, gateways)).To(BeEmpty())
 		})
 	}

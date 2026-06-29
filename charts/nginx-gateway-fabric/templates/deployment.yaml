@@ -37,7 +37,7 @@ spec:
         {{- end }}
       {{- end }}
     spec:
-      automountServiceAccountToken: true
+      automountServiceAccountToken: {{ .Values.nginxGateway.serviceAccount.automountServiceAccountToken }}
       containers:
       - args:
         - controller
@@ -46,6 +46,7 @@ spec:
         - --config={{ include "nginx-gateway.config-name" . }}
         - --service={{ include "nginx-gateway.fullname" . }}
         - --agent-tls-secret={{ .Values.certGenerator.agentTLSSecretName }}
+        - --server-tls-domain={{ .Values.serverTLSDomain }}
         {{- if .Values.nginxGateway.watchNamespaces }}
         - --watch-namespaces={{ join "," .Values.nginxGateway.watchNamespaces }}
         {{- end }}
@@ -118,6 +119,21 @@ spec:
         {{- if .Values.nginxGateway.snippets.enable }}
         - --snippets
         {{- end }}
+        {{- if .Values.nginxGateway.plmStorage.url }}
+        - --plm-storage-url={{ .Values.nginxGateway.plmStorage.url }}
+        {{- if .Values.nginxGateway.plmStorage.credentialsSecretName }}
+        - --plm-storage-credentials-secret={{ .Values.nginxGateway.plmStorage.credentialsSecretName }}
+        {{- end }}
+        {{- if .Values.nginxGateway.plmStorage.tls.caSecretName }}
+        - --plm-storage-ca-secret={{ .Values.nginxGateway.plmStorage.tls.caSecretName }}
+        {{- end }}
+        {{- if .Values.nginxGateway.plmStorage.tls.clientSSLSecretName }}
+        - --plm-storage-client-ssl-secret={{ .Values.nginxGateway.plmStorage.tls.clientSSLSecretName }}
+        {{- end }}
+        {{- if .Values.nginxGateway.plmStorage.tls.insecureSkipVerify }}
+        - --plm-storage-skip-verify
+        {{- end }}
+        {{- end }}
         {{- if .Capabilities.APIVersions.Has "security.openshift.io/v1/SecurityContextConstraints" }}
         - --nginx-scc={{ include "nginx-gateway.scc-name" . }}-nginx
         {{- end}}
@@ -178,7 +194,10 @@ spec:
             path: /readyz
             port: health
           initialDelaySeconds: {{ .Values.nginxGateway.readinessProbe.initialDelaySeconds }}
-          periodSeconds: 1
+          periodSeconds: {{ .Values.nginxGateway.readinessProbe.periodSeconds }}
+          failureThreshold: {{ .Values.nginxGateway.readinessProbe.failureThreshold }}
+          timeoutSeconds: {{ .Values.nginxGateway.readinessProbe.timeoutSeconds }}
+          successThreshold: {{ .Values.nginxGateway.readinessProbe.successThreshold }}
         {{- end }}
         securityContext:
           seccompProfile:
@@ -196,7 +215,7 @@ spec:
         {{- with .Values.nginxGateway.extraVolumeMounts -}}
         {{ toYaml . | nindent 8 }}
         {{- end }}
-      {{- if.Values.nginxGateway.priorityClassName }}
+      {{- if .Values.nginxGateway.priorityClassName }}
       priorityClassName: {{ .Values.nginxGateway.priorityClassName }}
       {{- end }}
       {{- if .Values.nginxGateway.topologySpreadConstraints }}

@@ -24,6 +24,7 @@ func createValidValidator() *validationfakes.FakeGenericValidator {
 	v.ValidateEndpointReturns(nil)
 	v.ValidateServiceNameReturns(nil)
 	v.ValidateNginxDurationReturns(nil)
+	v.ValidateAccessLogFormatStringReturns(nil)
 
 	return v
 }
@@ -34,6 +35,7 @@ func createInvalidValidator() *validationfakes.FakeGenericValidator {
 	v.ValidateEndpointReturns(errors.New("error"))
 	v.ValidateServiceNameReturns(errors.New("error"))
 	v.ValidateNginxDurationReturns(errors.New("error"))
+	v.ValidateAccessLogFormatStringReturns(errors.New("error"))
 
 	return v
 }
@@ -395,6 +397,11 @@ func TestTelemetryEnabledForNginxProxy(t *testing.T) {
 		enabled bool
 	}{
 		{
+			name:    "effective nginx proxy is nil",
+			ep:      nil,
+			enabled: false,
+		},
+		{
 			name: "telemetry struct is nil",
 			ep: &EffectiveNginxProxy{
 				Telemetry: nil,
@@ -532,6 +539,208 @@ func TestMetricsEnabledForNginxProxy(t *testing.T) {
 			port, enabled := MetricsEnabledForNginxProxy(test.ep)
 			g.Expect(port).To(Equal(test.port))
 			g.Expect(enabled).To(Equal(test.enabled))
+		})
+	}
+}
+
+// Add test cases for WAF merging in TestBuildEffectiveNginxProxy.
+func TestBuildEffectiveNginxProxy_WAF(t *testing.T) {
+	t.Parallel()
+
+	tests := []struct {
+		gcNp *NginxProxy
+		gwNp *NginxProxy
+		exp  *EffectiveNginxProxy
+		name string
+	}{
+		{
+			name: "gateway nginx proxy overrides WAF setting",
+			gcNp: &NginxProxy{
+				Valid: true,
+				Source: &ngfAPIv1alpha2.NginxProxy{
+					Spec: ngfAPIv1alpha2.NginxProxySpec{
+						WAF: &ngfAPIv1alpha2.WAFSpec{Enable: helpers.GetPointer(false)},
+					},
+				},
+			},
+			gwNp: &NginxProxy{
+				Valid: true,
+				Source: &ngfAPIv1alpha2.NginxProxy{
+					Spec: ngfAPIv1alpha2.NginxProxySpec{
+						WAF: &ngfAPIv1alpha2.WAFSpec{Enable: helpers.GetPointer(true)},
+					},
+				},
+			},
+			exp: &EffectiveNginxProxy{
+				WAF: &ngfAPIv1alpha2.WAFSpec{Enable: helpers.GetPointer(true)},
+			},
+		},
+		{
+			name: "gateway class WAF setting when gateway has no WAF config",
+			gcNp: &NginxProxy{
+				Valid: true,
+				Source: &ngfAPIv1alpha2.NginxProxy{
+					Spec: ngfAPIv1alpha2.NginxProxySpec{
+						WAF: &ngfAPIv1alpha2.WAFSpec{Enable: helpers.GetPointer(true)},
+					},
+				},
+			},
+			gwNp: &NginxProxy{
+				Valid: true,
+				Source: &ngfAPIv1alpha2.NginxProxy{
+					Spec: ngfAPIv1alpha2.NginxProxySpec{
+						// No WAF field set
+					},
+				},
+			},
+			exp: &EffectiveNginxProxy{
+				WAF: &ngfAPIv1alpha2.WAFSpec{Enable: helpers.GetPointer(true)},
+			},
+		},
+		{
+			name: "gateway class enables WAF, gateway overrides only disableCookieSeed",
+			gcNp: &NginxProxy{
+				Valid: true,
+				Source: &ngfAPIv1alpha2.NginxProxy{
+					Spec: ngfAPIv1alpha2.NginxProxySpec{
+						WAF: &ngfAPIv1alpha2.WAFSpec{Enable: helpers.GetPointer(true)},
+					},
+				},
+			},
+			gwNp: &NginxProxy{
+				Valid: true,
+				Source: &ngfAPIv1alpha2.NginxProxy{
+					Spec: ngfAPIv1alpha2.NginxProxySpec{
+						WAF: &ngfAPIv1alpha2.WAFSpec{DisableCookieSeed: helpers.GetPointer(true)},
+					},
+				},
+			},
+			exp: &EffectiveNginxProxy{
+				WAF: &ngfAPIv1alpha2.WAFSpec{
+					Enable:            helpers.GetPointer(true),
+					DisableCookieSeed: helpers.GetPointer(true),
+				},
+			},
+		},
+		{
+			name: "both have WAF disabled",
+			gcNp: &NginxProxy{
+				Valid: true,
+				Source: &ngfAPIv1alpha2.NginxProxy{
+					Spec: ngfAPIv1alpha2.NginxProxySpec{
+						WAF: &ngfAPIv1alpha2.WAFSpec{Enable: helpers.GetPointer(false)},
+					},
+				},
+			},
+			gwNp: &NginxProxy{
+				Valid: true,
+				Source: &ngfAPIv1alpha2.NginxProxy{
+					Spec: ngfAPIv1alpha2.NginxProxySpec{
+						WAF: &ngfAPIv1alpha2.WAFSpec{Enable: helpers.GetPointer(false)},
+					},
+				},
+			},
+			exp: &EffectiveNginxProxy{
+				WAF: &ngfAPIv1alpha2.WAFSpec{Enable: helpers.GetPointer(false)},
+			},
+		},
+		{
+			name: "both have WAF unset",
+			gcNp: &NginxProxy{
+				Valid: true,
+				Source: &ngfAPIv1alpha2.NginxProxy{
+					Spec: ngfAPIv1alpha2.NginxProxySpec{},
+				},
+			},
+			gwNp: &NginxProxy{
+				Valid: true,
+				Source: &ngfAPIv1alpha2.NginxProxy{
+					Spec: ngfAPIv1alpha2.NginxProxySpec{},
+				},
+			},
+			exp: &EffectiveNginxProxy{},
+		},
+		{
+			name: "gateway class sets bundleFailOpen, gateway has no WAF config",
+			gcNp: &NginxProxy{
+				Valid: true,
+				Source: &ngfAPIv1alpha2.NginxProxy{
+					Spec: ngfAPIv1alpha2.NginxProxySpec{
+						WAF: &ngfAPIv1alpha2.WAFSpec{BundleFailOpen: helpers.GetPointer(true)},
+					},
+				},
+			},
+			gwNp: &NginxProxy{
+				Valid: true,
+				Source: &ngfAPIv1alpha2.NginxProxy{
+					Spec: ngfAPIv1alpha2.NginxProxySpec{},
+				},
+			},
+			exp: &EffectiveNginxProxy{
+				WAF: &ngfAPIv1alpha2.WAFSpec{BundleFailOpen: helpers.GetPointer(true)},
+			},
+		},
+		{
+			name: "gateway overrides bundleFailOpen set by gateway class",
+			gcNp: &NginxProxy{
+				Valid: true,
+				Source: &ngfAPIv1alpha2.NginxProxy{
+					Spec: ngfAPIv1alpha2.NginxProxySpec{
+						WAF: &ngfAPIv1alpha2.WAFSpec{BundleFailOpen: helpers.GetPointer(true)},
+					},
+				},
+			},
+			gwNp: &NginxProxy{
+				Valid: true,
+				Source: &ngfAPIv1alpha2.NginxProxy{
+					Spec: ngfAPIv1alpha2.NginxProxySpec{
+						WAF: &ngfAPIv1alpha2.WAFSpec{BundleFailOpen: helpers.GetPointer(false)},
+					},
+				},
+			},
+			exp: &EffectiveNginxProxy{
+				WAF: &ngfAPIv1alpha2.WAFSpec{BundleFailOpen: helpers.GetPointer(false)},
+			},
+		},
+		{
+			name: "gateway class enables WAF and sets bundleFailOpen, gateway overrides only disableCookieSeed",
+			gcNp: &NginxProxy{
+				Valid: true,
+				Source: &ngfAPIv1alpha2.NginxProxy{
+					Spec: ngfAPIv1alpha2.NginxProxySpec{
+						WAF: &ngfAPIv1alpha2.WAFSpec{
+							Enable:         helpers.GetPointer(true),
+							BundleFailOpen: helpers.GetPointer(true),
+						},
+					},
+				},
+			},
+			gwNp: &NginxProxy{
+				Valid: true,
+				Source: &ngfAPIv1alpha2.NginxProxy{
+					Spec: ngfAPIv1alpha2.NginxProxySpec{
+						WAF: &ngfAPIv1alpha2.WAFSpec{DisableCookieSeed: helpers.GetPointer(true)},
+					},
+				},
+			},
+			exp: &EffectiveNginxProxy{
+				WAF: &ngfAPIv1alpha2.WAFSpec{
+					Enable:            helpers.GetPointer(true),
+					DisableCookieSeed: helpers.GetPointer(true),
+					BundleFailOpen:    helpers.GetPointer(true),
+				},
+			},
+		},
+	}
+
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			t.Parallel()
+			g := NewWithT(t)
+
+			enp := buildEffectiveNginxProxy(test.gcNp, test.gwNp)
+			g.Expect(enp).ToNot(BeNil())
+			g.Expect(enp.WAF).To(Equal(test.exp.WAF))
 		})
 	}
 }
@@ -1418,9 +1627,11 @@ func TestValidateLogging(t *testing.T) {
 
 	tests := []struct {
 		np             *ngfAPIv1alpha2.NginxProxy
+		validator      *validationfakes.FakeGenericValidator
 		name           string
 		errorString    string
 		expectErrCount int
+		plus           bool
 	}{
 		{
 			np: &ngfAPIv1alpha2.NginxProxy{
@@ -1430,6 +1641,7 @@ func TestValidateLogging(t *testing.T) {
 					},
 				},
 			},
+			validator:      createValidValidator(),
 			name:           "valid debug log level",
 			errorString:    "",
 			expectErrCount: 0,
@@ -1442,6 +1654,7 @@ func TestValidateLogging(t *testing.T) {
 					},
 				},
 			},
+			validator:      createValidValidator(),
 			name:           "valid info log level",
 			errorString:    "",
 			expectErrCount: 0,
@@ -1454,6 +1667,7 @@ func TestValidateLogging(t *testing.T) {
 					},
 				},
 			},
+			validator:      createValidValidator(),
 			name:           "valid notice log level",
 			errorString:    "",
 			expectErrCount: 0,
@@ -1466,6 +1680,7 @@ func TestValidateLogging(t *testing.T) {
 					},
 				},
 			},
+			validator:      createValidValidator(),
 			name:           "valid warn log level",
 			errorString:    "",
 			expectErrCount: 0,
@@ -1478,6 +1693,7 @@ func TestValidateLogging(t *testing.T) {
 					},
 				},
 			},
+			validator:      createValidValidator(),
 			name:           "valid error log level",
 			errorString:    "",
 			expectErrCount: 0,
@@ -1490,6 +1706,7 @@ func TestValidateLogging(t *testing.T) {
 					},
 				},
 			},
+			validator:      createValidValidator(),
 			name:           "valid crit log level",
 			errorString:    "",
 			expectErrCount: 0,
@@ -1502,6 +1719,7 @@ func TestValidateLogging(t *testing.T) {
 					},
 				},
 			},
+			validator:      createValidValidator(),
 			name:           "valid alert log level",
 			errorString:    "",
 			expectErrCount: 0,
@@ -1514,6 +1732,7 @@ func TestValidateLogging(t *testing.T) {
 					},
 				},
 			},
+			validator:      createValidValidator(),
 			name:           "valid emerg log level",
 			errorString:    "",
 			expectErrCount: 0,
@@ -1526,7 +1745,8 @@ func TestValidateLogging(t *testing.T) {
 					},
 				},
 			},
-			name: "invalid log level",
+			validator: createValidValidator(),
+			name:      "invalid log level",
 			errorString: "spec.logging.errorLevel: Unsupported value: \"invalid-log-level\": supported values:" +
 				" \"debug\", \"info\", \"notice\", \"warn\", \"error\", \"crit\", \"alert\", \"emerg\"",
 			expectErrCount: 1,
@@ -1537,7 +1757,105 @@ func TestValidateLogging(t *testing.T) {
 					Logging: &ngfAPIv1alpha2.NginxLogging{},
 				},
 			},
+			validator:      createValidValidator(),
 			name:           "empty log level",
+			errorString:    "",
+			expectErrCount: 0,
+		},
+		{
+			np: &ngfAPIv1alpha2.NginxProxy{
+				Spec: ngfAPIv1alpha2.NginxProxySpec{
+					Logging: &ngfAPIv1alpha2.NginxLogging{
+						ErrorLogFormat: helpers.GetPointer(ngfAPIv1alpha2.NginxErrorLogFormatJSON),
+					},
+				},
+			},
+			name:           "errorLogFormat json is accepted on NGINX Plus",
+			plus:           true,
+			errorString:    "",
+			expectErrCount: 0,
+		},
+		{
+			np: &ngfAPIv1alpha2.NginxProxy{
+				Spec: ngfAPIv1alpha2.NginxProxySpec{
+					Logging: &ngfAPIv1alpha2.NginxLogging{
+						ErrorLogFormat: helpers.GetPointer(ngfAPIv1alpha2.NginxErrorLogFormatDefault),
+					},
+				},
+			},
+			name:           "errorLogFormat default is accepted on OSS",
+			plus:           false,
+			errorString:    "",
+			expectErrCount: 0,
+		},
+		{
+			np: &ngfAPIv1alpha2.NginxProxy{
+				Spec: ngfAPIv1alpha2.NginxProxySpec{
+					Logging: &ngfAPIv1alpha2.NginxLogging{
+						ErrorLogFormat: helpers.GetPointer(ngfAPIv1alpha2.NginxErrorLogFormatJSON),
+					},
+				},
+			},
+			name: "errorLogFormat json is rejected on OSS because JSON logs require NGINX Plus",
+			plus: false,
+			errorString: "spec.logging.errorLogFormat: Invalid value: \"json\":" +
+				" JSON-formatted error logs are only supported with NGINX Plus",
+			expectErrCount: 1,
+		},
+		{
+			np: &ngfAPIv1alpha2.NginxProxy{
+				Spec: ngfAPIv1alpha2.NginxProxySpec{
+					Logging: &ngfAPIv1alpha2.NginxLogging{
+						AccessLog: &ngfAPIv1alpha2.NginxAccessLog{
+							Format: helpers.GetPointer(
+								`$remote_addr - $remote_user [$time_local] "$request" $status`,
+							),
+						},
+					},
+				},
+			},
+			validator:      createValidValidator(),
+			name:           "valid access log format",
+			errorString:    "",
+			expectErrCount: 0,
+		},
+		{
+			np: &ngfAPIv1alpha2.NginxProxy{
+				Spec: ngfAPIv1alpha2.NginxProxySpec{
+					Logging: &ngfAPIv1alpha2.NginxLogging{
+						AccessLog: &ngfAPIv1alpha2.NginxAccessLog{
+							Format: helpers.GetPointer("bad format"),
+						},
+					},
+				},
+			},
+			validator:      createInvalidValidator(),
+			name:           "invalid access log format",
+			expectErrCount: 1,
+		},
+		{
+			np: &ngfAPIv1alpha2.NginxProxy{
+				Spec: ngfAPIv1alpha2.NginxProxySpec{
+					Logging: &ngfAPIv1alpha2.NginxLogging{
+						AccessLog: &ngfAPIv1alpha2.NginxAccessLog{},
+					},
+				},
+			},
+			validator:      createValidValidator(),
+			name:           "nil access log format",
+			errorString:    "",
+			expectErrCount: 0,
+		},
+		{
+			np: &ngfAPIv1alpha2.NginxProxy{
+				Spec: ngfAPIv1alpha2.NginxProxySpec{
+					Logging: &ngfAPIv1alpha2.NginxLogging{
+						AccessLog: nil,
+					},
+				},
+			},
+			validator:      createValidValidator(),
+			name:           "nil access log",
 			errorString:    "",
 			expectErrCount: 0,
 		},
@@ -1548,9 +1866,9 @@ func TestValidateLogging(t *testing.T) {
 			t.Parallel()
 			g := NewWithT(t)
 
-			allErrs := validateLogging(test.np)
+			allErrs := validateLogging(test.validator, test.np, test.plus)
 			g.Expect(allErrs).To(HaveLen(test.expectErrCount))
-			if len(allErrs) > 0 {
+			if len(allErrs) > 0 && test.errorString != "" {
 				g.Expect(allErrs.ToAggregate().Error()).To(Equal(test.errorString))
 			}
 		})
@@ -1701,6 +2019,25 @@ func TestValidateServerTokens(t *testing.T) {
 			plus:           true,
 		},
 		{
+			name:      "valid keyword serverTokens with NGINX Plus",
+			validator: createValidValidator(),
+			np: &ngfAPIv1alpha2.NginxProxy{
+				Spec: ngfAPIv1alpha2.NginxProxySpec{
+					ServerTokens: helpers.GetPointer(ServerTokenOff),
+				},
+			},
+			expectErrCount: 0,
+			plus:           true,
+		},
+		{
+			name:      "nil serverTokens",
+			validator: createValidValidator(),
+			np: &ngfAPIv1alpha2.NginxProxy{
+				Spec: ngfAPIv1alpha2.NginxProxySpec{},
+			},
+			expectErrCount: 0,
+		},
+		{
 			name:      "invalid custom serverTokens with NGINX OSS",
 			validator: createValidValidator(),
 			np: &ngfAPIv1alpha2.NginxProxy{
@@ -1713,6 +2050,21 @@ func TestValidateServerTokens(t *testing.T) {
 				"\"custom-string\": custom string values for serverTokens are only allowed with NGINX Plus." +
 				" For NGINX OSS, allowed values are 'off', 'on', and 'build'.",
 		},
+		{
+			name: "invalid custom serverTokens with NGINX Plus containing dangerous chars",
+			validator: func() *validationfakes.FakeGenericValidator {
+				v := createValidValidator()
+				v.ValidateServerTokensValueReturns(errors.New("error"))
+				return v
+			}(),
+			np: &ngfAPIv1alpha2.NginxProxy{
+				Spec: ngfAPIv1alpha2.NginxProxySpec{
+					ServerTokens: helpers.GetPointer(`bad"value`),
+				},
+			},
+			expectErrCount: 1,
+			plus:           true,
+		},
 	}
 
 	for _, test := range tests {
@@ -1720,10 +2072,133 @@ func TestValidateServerTokens(t *testing.T) {
 			t.Parallel()
 			g := NewWithT(t)
 
-			allErrs := validateServerTokens(test.np, test.plus)
+			allErrs := validateServerTokens(test.validator, test.np, test.plus)
+			g.Expect(allErrs).To(HaveLen(test.expectErrCount))
+			if test.errorString != "" {
+				g.Expect(allErrs.ToAggregate().Error()).To(Equal(test.errorString))
+			}
+		})
+	}
+}
+
+func TestValidateCompression(t *testing.T) {
+	t.Parallel()
+
+	tests := []struct {
+		name            string
+		np              *ngfAPIv1alpha2.NginxProxy
+		validator       *validationfakes.FakeGenericValidator
+		expErrSubstring string
+		expectErrCount  int
+	}{
+		{
+			name:           "nil compression is valid",
+			validator:      createValidValidator(),
+			np:             &ngfAPIv1alpha2.NginxProxy{},
+			expectErrCount: 0,
+		},
+		{
+			name:      "valid compression with mimeTypes",
+			validator: createValidValidator(),
+			np: &ngfAPIv1alpha2.NginxProxy{
+				Spec: ngfAPIv1alpha2.NginxProxySpec{
+					Compression: &ngfAPIv1alpha2.Compression{
+						Type:      ngfAPIv1alpha2.GzipCompressionType,
+						MimeTypes: []string{"text/css", "application/json"},
+						Gzip:      &ngfAPIv1alpha2.GzipSettings{},
+					},
+				},
+			},
+			expectErrCount: 0,
+		},
+		{
+			name:      "invalid mimeType value",
+			validator: createValidValidator(),
+			np: &ngfAPIv1alpha2.NginxProxy{
+				Spec: ngfAPIv1alpha2.NginxProxySpec{
+					Compression: &ngfAPIv1alpha2.Compression{
+						Type:      ngfAPIv1alpha2.GzipCompressionType,
+						MimeTypes: []string{"text/css; add_header X-Test injected;"},
+						Gzip:      &ngfAPIv1alpha2.GzipSettings{},
+					},
+				},
+			},
+			expErrSubstring: "compression.mimeTypes",
+			expectErrCount:  1,
+		},
+		{
+			name:      "invalid gzip disable value",
+			validator: createInvalidValidator(),
+			np: &ngfAPIv1alpha2.NginxProxy{
+				Spec: ngfAPIv1alpha2.NginxProxySpec{
+					Compression: &ngfAPIv1alpha2.Compression{
+						Type: ngfAPIv1alpha2.GzipCompressionType,
+						Gzip: &ngfAPIv1alpha2.GzipSettings{
+							Disable: []string{"msie6"},
+						},
+					},
+				},
+			},
+			expErrSubstring: "compression.gzip.disable",
+			expectErrCount:  1,
+		},
+		{
+			name:      "multiple invalid mimeTypes",
+			validator: createValidValidator(),
+			np: &ngfAPIv1alpha2.NginxProxy{
+				Spec: ngfAPIv1alpha2.NginxProxySpec{
+					Compression: &ngfAPIv1alpha2.Compression{
+						Type:      ngfAPIv1alpha2.GzipCompressionType,
+						MimeTypes: []string{"text/css; foo=bar", "application/json\nadd_header X-Test injected;"},
+						Gzip:      &ngfAPIv1alpha2.GzipSettings{},
+					},
+				},
+			},
+			expErrSubstring: "compression.mimeTypes",
+			expectErrCount:  2,
+		},
+		{
+			name:      "wildcard mimeType rejected",
+			validator: createValidValidator(),
+			np: &ngfAPIv1alpha2.NginxProxy{
+				Spec: ngfAPIv1alpha2.NginxProxySpec{
+					Compression: &ngfAPIv1alpha2.Compression{
+						Type:      ngfAPIv1alpha2.GzipCompressionType,
+						MimeTypes: []string{"text/*"},
+						Gzip:      &ngfAPIv1alpha2.GzipSettings{},
+					},
+				},
+			},
+			expErrSubstring: "compression.mimeTypes",
+			expectErrCount:  1,
+		},
+		{
+			name:      "valid compression with gzip disable",
+			validator: createValidValidator(),
+			np: &ngfAPIv1alpha2.NginxProxy{
+				Spec: ngfAPIv1alpha2.NginxProxySpec{
+					Compression: &ngfAPIv1alpha2.Compression{
+						Type:      ngfAPIv1alpha2.GzipCompressionType,
+						MimeTypes: []string{"text/css"},
+						Gzip: &ngfAPIv1alpha2.GzipSettings{
+							Disable: []string{"msie6", "Chrome"},
+						},
+					},
+				},
+			},
+			expectErrCount: 0,
+		},
+	}
+
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			t.Parallel()
+			g := NewWithT(t)
+
+			allErrs := validateCompression(test.validator, test.np)
 			g.Expect(allErrs).To(HaveLen(test.expectErrCount))
 			if len(allErrs) > 0 {
-				g.Expect(allErrs.ToAggregate().Error()).To(Equal(test.errorString))
+				g.Expect(allErrs.ToAggregate().Error()).To(ContainSubstring(test.expErrSubstring))
 			}
 		})
 	}

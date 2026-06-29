@@ -1,6 +1,7 @@
 package config
 
 import (
+	"fmt"
 	"strings"
 	"testing"
 
@@ -119,6 +120,10 @@ func TestExecuteMaps(t *testing.T) {
 func TestBuildAddHeaderMaps(t *testing.T) {
 	t.Parallel()
 	g := NewWithT(t)
+	// Add headers are deliberately provided in non-alphabetical order (and with a duplicate) so the
+	// expected maps below verify that the output is deduplicated and emitted in a stable, sorted
+	// order. The maps are derived from a Go map, whose iteration order is randomized; emitting them
+	// unsorted causes spurious NGINX reloads.
 	pathRules := []dataplane.PathRule{
 		{
 			MatchRules: []dataplane.MatchRule{
@@ -126,6 +131,10 @@ func TestBuildAddHeaderMaps(t *testing.T) {
 					Filters: dataplane.HTTPFilters{
 						RequestHeaderModifiers: &dataplane.HTTPHeaderFilter{
 							Add: []dataplane.HTTPHeader{
+								{
+									Name:  "my-zeta-add-header",
+									Value: "some-value-123",
+								},
 								{
 									Name:  "my-add-header",
 									Value: "some-value-123",
@@ -159,6 +168,10 @@ func TestBuildAddHeaderMaps(t *testing.T) {
 							},
 							Add: []dataplane.HTTPHeader{
 								{
+									Name:  "my-alpha-add-header",
+									Value: "some-value-123",
+								},
+								{
 									Name:  "my-add-header",
 									Value: "some-value-123",
 								},
@@ -181,6 +194,7 @@ func TestBuildAddHeaderMaps(t *testing.T) {
 			IsDefault: true,
 		},
 	}
+	// expectedMap is in alphabetical order, matching the deterministic order buildAddHeaderMaps emits.
 	expectedMap := []shared.Map{
 		{
 			Source:   "${http_my_add_header}",
@@ -190,6 +204,17 @@ func TestBuildAddHeaderMaps(t *testing.T) {
 				{
 					Value:  "~.*",
 					Result: "${http_my_add_header},",
+				},
+			},
+		},
+		{
+			Source:   "${http_my_alpha_add_header}",
+			Variable: "$my_alpha_add_header_header_var",
+			Parameters: []shared.MapParameter{
+				{Value: "default", Result: "''"},
+				{
+					Value:  "~.*",
+					Result: "${http_my_alpha_add_header},",
 				},
 			},
 		},
@@ -204,17 +229,28 @@ func TestBuildAddHeaderMaps(t *testing.T) {
 				},
 			},
 		},
+		{
+			Source:   "${http_my_zeta_add_header}",
+			Variable: "$my_zeta_add_header_header_var",
+			Parameters: []shared.MapParameter{
+				{Value: "default", Result: "''"},
+				{
+					Value:  "~.*",
+					Result: "${http_my_zeta_add_header},",
+				},
+			},
+		},
 	}
 	maps := buildAddHeaderMaps(testServers)
 
-	g.Expect(maps).To(ConsistOf(expectedMap))
+	g.Expect(maps).To(Equal(expectedMap))
 }
 
 func TestExecuteStreamMaps(t *testing.T) {
 	t.Parallel()
 	g := NewWithT(t)
 	conf := dataplane.Configuration{
-		TLSPassthroughServers: []dataplane.Layer4VirtualServer{
+		TLSServers: []dataplane.Layer4VirtualServer{
 			{
 				Hostname: "example.com",
 				Port:     8081,
@@ -266,10 +302,10 @@ func TestExecuteStreamMaps(t *testing.T) {
 	}
 
 	expSubStrings := map[string]int{
-		"example.com unix:/var/run/nginx/example.com-8081.sock;":           1,
-		"example.com unix:/var/run/nginx/example.com-8080.sock;":           1,
-		"cafe.example.com unix:/var/run/nginx/cafe.example.com-8080.sock;": 1,
-		"app.example.com unix:/var/run/nginx/https8080.sock;":              1,
+		fmt.Sprintf("example.com %sexample.com-8081.sock;", SocketBasePath):           1,
+		fmt.Sprintf("example.com %sexample.com-8080.sock;", SocketBasePath):           1,
+		fmt.Sprintf("cafe.example.com %scafe.example.com-8080.sock;", SocketBasePath): 1,
+		fmt.Sprintf("app.example.com %shttps8080.sock;", SocketBasePath):              1,
 		"hostnames": 2,
 		"default":   2,
 	}
@@ -292,7 +328,7 @@ func TestCreateStreamMaps(t *testing.T) {
 	t.Parallel()
 	g := NewWithT(t)
 	conf := dataplane.Configuration{
-		TLSPassthroughServers: []dataplane.Layer4VirtualServer{
+		TLSServers: []dataplane.Layer4VirtualServer{
 			{
 				Hostname: "example.com",
 				Port:     8081,
@@ -419,12 +455,98 @@ func TestCreateStreamMapsWithEmpty(t *testing.T) {
 	t.Parallel()
 	g := NewWithT(t)
 	conf := dataplane.Configuration{
-		TLSPassthroughServers: nil,
+		TLSServers: nil,
 	}
 
 	maps := createStreamMaps(conf)
 
 	g.Expect(maps).To(BeNil())
+}
+
+func TestCreateStreamMapsWithTerminate(t *testing.T) {
+	t.Parallel()
+	g := NewWithT(t)
+
+	conf := dataplane.Configuration{
+		TLSServers: []dataplane.Layer4VirtualServer{
+			{
+				// Passthrough server
+				Hostname: "passthrough.example.com",
+				Port:     8443,
+				Upstreams: []dataplane.Layer4Upstream{
+					{Name: "pt-backend", Weight: 0},
+				},
+			},
+			{
+				// Terminate server
+				Hostname: "terminate.example.com",
+				Port:     8443,
+				SSL: &dataplane.SSL{
+					KeyPairIDs: []dataplane.SSLKeyPairID{"cert1"},
+				},
+				Upstreams: []dataplane.Layer4Upstream{
+					{Name: "term-backend", Weight: 0},
+				},
+			},
+			{
+				// Default terminate server
+				Hostname:  "~^",
+				Port:      8443,
+				IsDefault: true,
+				SSL: &dataplane.SSL{
+					KeyPairIDs: []dataplane.SSLKeyPairID{"default-cert"},
+				},
+			},
+			{
+				// Terminate server with no endpoints
+				Hostname: "no-ep-terminate.example.com",
+				Port:     8443,
+				SSL: &dataplane.SSL{
+					KeyPairIDs: []dataplane.SSLKeyPairID{"cert2"},
+				},
+				Upstreams: []dataplane.Layer4Upstream{
+					{Name: "no-ep-backend", Weight: 0},
+				},
+			},
+		},
+		StreamUpstreams: []dataplane.Upstream{
+			{
+				Name: "pt-backend",
+				Endpoints: []resolver.Endpoint{
+					{Address: "10.0.0.1", Port: 80},
+				},
+			},
+			{
+				Name: "term-backend",
+				Endpoints: []resolver.Endpoint{
+					{Address: "10.0.0.2", Port: 80},
+				},
+			},
+			{
+				Name:      "no-ep-backend",
+				Endpoints: nil,
+			},
+		},
+	}
+
+	maps := createStreamMaps(conf)
+
+	expectedMaps := []shared.Map{
+		{
+			Source:   "$ssl_preread_server_name",
+			Variable: getTLSPassthroughVarName(8443),
+			Parameters: []shared.MapParameter{
+				{Value: "passthrough.example.com", Result: getSocketNameTLS(8443, "passthrough.example.com")},
+				{Value: "terminate.example.com", Result: getSocketNameTLSTerminate(8443, "terminate.example.com")},
+				{Value: "~^", Result: getSocketNameTLSTerminate(8443, "~^")},
+				{Value: "no-ep-terminate.example.com", Result: emptyStringSocket},
+				{Value: "default", Result: connectionClosedStreamServerSocket},
+			},
+			UseHostnames: true,
+		},
+	}
+
+	g.Expect(maps).To(ConsistOf(expectedMaps))
 }
 
 func TestBuildInferenceMaps(t *testing.T) {

@@ -48,12 +48,14 @@ const (
 	expectedJWTFileOnlyError             = "source File must not set spec.remote"
 	expectedJWTRemoteRequiredError       = "source Remote requires spec.remote to be set"
 	expectedJWTRemoteOnlyError           = "source Remote must not set spec.file"
+	expectedDuplicateClaimNamesError     = "claim names must be unique within a rule"
 
 	expectedTargetRefKindMustBeGatewayOrHTTPRouteOrGrpcRouteError = "TargetRef Kind must be one of: " +
 		"Gateway, HTTPRoute, or GRPCRoute"
 	expectedTargetRefKindMustBeHTTPRouteOrGrpcRouteError = "TargetRef Kind must be: HTTPRoute or GRPCRoute"
 	expectedTargetRefKindServiceError                    = "TargetRefs Kind must be: Service"
 	expectedTargetRefKindGatewayError                    = "TargetRef Kind must be: Gateway"
+	expectedTargetRefAllSameKindError                    = "All TargetRefs must be the same Kind"
 
 	// Group validation errors.
 	expectedTargetRefGroupError     = "TargetRef Group must be gateway.networking.k8s.io"
@@ -71,11 +73,29 @@ const (
 
 	expectedIfModeSetTrustedAddressesError = "if mode is set, trustedAddresses is a required field"
 
+	// Logging validation error.
+	expectedJSONNotSupportedWithDebugError = "JSON-formatted error logs are not supported when errorLevel is debug"
+
 	// Replicas validation error.
 	expectedMinReplicasLessThanOrEqualError = "minReplicas must be less than or equal to maxReplicas"
 
 	// Strategy validation error.
 	expectedStrategyMustBeOfTypeRatio = "ratio can only be specified if strategy is of type ratio"
+
+	// PodDisruptionBudget validation error.
+	expectedPDBExactlyOneFieldError = "exactly one of minAvailable or maxUnavailable must be set"
+
+	// Compression validation errors.
+	expectedCompressionGzipRequiredError = "type 'gzip' requires spec.compression.gzip to be set"
+	// ServerTokens validation error.
+	expectedServerTokensPatternError = `serverTokens in body should match`
+
+	// AccessLog format validation error.
+	expectedAccessLogFormatPatternError = `format in body should match`
+
+	// ExtraAuthArgs validation error.
+	expectedExtraAuthArgsKeyError = "extraAuthArgs keys must contain only alphanumeric characters, hyphens, " +
+		"underscores, or dots"
 
 	// Snippets validation errors.
 	expectedSnippetsContextError = "Only one snippet allowed per context"
@@ -83,6 +103,30 @@ const (
 	// HashMethodKey validation error.
 	expectedHashKeyLoadBalancingTypeError = `hashMethodKey is required when loadBalancingMethod ` +
 		`is 'hash' or 'hash consistent'`
+
+	// WAFPolicy errors.
+	expectedWAFFileIfAndOnlyIfFileTypeError     = "destination.file must be set if and only if type is file"
+	expectedWAFSyslogIfAndOnlyIfSyslogType      = "destination.syslog must be set if and only if type is syslog"
+	expectedWAFPolicySourceNotSetForPLMError    = "policySource must not be set when type is PLM"
+	expectedWAFPolicyRefNotSetForNonPLMError    = "policyRef must not be set when type is not PLM"
+	expectedWAFPolicySourceTypeMatchError       = "type must match the configured policy source"
+	expectedWAFPolicyRefRequiredForPLMError     = "policyRef.apPolicyRef is required when type is PLM"
+	expectedWAFPolicySourceMutualExclusionError = "exactly one of httpSource, nimSource, " +
+		"or n1cSource must be set"
+	expectedWAFLogSourceOrLogRefError        = "exactly one of logSource or logRef must be set"
+	expectedWAFLogSourceMutualExclusionError = "exactly one of defaultProfile, httpSource, " +
+		"nimSource, or n1cSource must be set"
+
+	expectedWAFN1CLogProfileMutualExclusionError = "exactly one of profileName or profileObjectID must be set"
+	expectedWAFN1CLogProfileObjectIDPatternError = `^lp_[A-Za-z0-9_-]+$`
+	expectedWAFValidationMutualExclusionError    = "verifyChecksum and expectedChecksum are mutually exclusive"
+	expectedWAFVerifyChecksumHTTPOnlyError       = "policySource.validation.verifyChecksum is only supported for type HTTP"
+	expectedWAFAPResourceNamePatternError        = `^[a-z0-9]([-a-z0-9]*[a-z0-9])?(\.[a-z0-9]([-a-z0-9]*[a-z0-9])?)*$`
+	expectedWAFAPResourceNamespacePatternError   = `^[a-z0-9]([-a-z0-9]*[a-z0-9])?$`
+	expectedWAFPLMLogSourceTypeError             = "securityLogs[*].logRef.apLogConfRef is only allowed when type is PLM"
+	expectedWAFNIMPolicyUIDPatternError          = `^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$`
+	expectedWAFN1CPolicyObjectIDPatternError     = `^pol_[A-Za-z0-9_-]+$`
+	expectedWAFN1CPolicyVersionIDPatternError    = `^pv_[A-Za-z0-9_-]+$`
 
 	// Namespace for tests.
 	defaultNamespace = "default"

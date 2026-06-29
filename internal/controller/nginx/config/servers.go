@@ -9,13 +9,15 @@ import (
 	"strings"
 	gotemplate "text/template"
 
-	"github.com/dlclark/regexp2"
+	"github.com/dlclark/regexp2/v2"
 	"k8s.io/apimachinery/pkg/types"
 
+	"github.com/nginx/nginx-gateway-fabric/v2/apis/v1alpha2"
 	"github.com/nginx/nginx-gateway-fabric/v2/internal/controller/nginx/config/http"
 	"github.com/nginx/nginx-gateway-fabric/v2/internal/controller/nginx/config/policies"
 	"github.com/nginx/nginx-gateway-fabric/v2/internal/controller/nginx/config/shared"
 	"github.com/nginx/nginx-gateway-fabric/v2/internal/controller/state/dataplane"
+	"github.com/nginx/nginx-gateway-fabric/v2/internal/controller/state/graph"
 	"github.com/nginx/nginx-gateway-fabric/v2/internal/framework/helpers"
 )
 
@@ -24,13 +26,45 @@ var serversTemplate = gotemplate.Must(
 		"contains": func(str http.LocationType, substr string) bool {
 			return strings.Contains(string(str), substr)
 		},
+		"headerToNginxVar":   headerToNginxVar,
+		"extAuthResponseVar": func(h string) string { return extAuthResponseVarPrefix + headerToNginxVar(h) },
+		"upstreamHTTPVar":    func(h string) string { return upstreamHTTPVarPrefix + headerToNginxVar(h) },
 	}).Parse(serversTemplateText),
 )
+
+// headerToNginxVar converts an HTTP header name to its NGINX variable form.
+func headerToNginxVar(h string) string {
+	return strings.ToLower(strings.ReplaceAll(h, "-", "_"))
+}
 
 const (
 	// HeaderMatchSeparator is the separator for constructing header-based match for NJS.
 	HeaderMatchSeparator = ":"
 	rootPath             = "/"
+
+	// extAuthPathHeader is the header name used to pass the original request path to the auth server.
+	extAuthPathHeader = "Path"
+	// extAuthPathValue is the NGINX variable for the original request URI.
+	extAuthPathValue = "$request_uri"
+	// extAuthMethodHeader is the header name used to pass the original request method to the auth server.
+	extAuthMethodHeader = "Method"
+	// extAuthMethodValue is the NGINX variable for the original request method.
+	extAuthMethodValue = "$request_method"
+	// extAuthAuthorizationHeader forward the client's Authorization header to the
+	// auth server.
+	extAuthAuthorizationHeader = "Authorization"
+	// extAuthAuthorizationValue is the NGINX variable for the original request Authorization header.
+	extAuthAuthorizationValue = "$http_authorization"
+	// proxyPassRequestHeadersOff disables forwarding of all client request headers to the proxied server.
+	proxyPassRequestHeadersOff = "off"
+	// httpHeaderVarPrefix is the NGINX variable prefix for accessing request headers.
+	httpHeaderVarPrefix = "$http_"
+	// extAuthResponseVarPrefix is the NGINX variable prefix for storing auth response header values.
+	extAuthResponseVarPrefix = "$ext_auth_response_"
+	// upstreamHTTPVarPrefix is the NGINX variable prefix for accessing upstream response headers.
+	upstreamHTTPVarPrefix = "$upstream_http_"
+	// proxyPassRequestBodyOff disables forwarding the request body to the proxied server.
+	proxyPassRequestBodyOff = "off"
 
 	// misdirectedRequestSNIVarPrefix is the prefix for the per-port SNI listener ID variable.
 	misdirectedRequestSNIVarPrefix = "$sni_listener_id_"
@@ -139,13 +173,19 @@ func createServers(
 	finalMatchPairs := make(httpMatchPairs)
 	sharedTLSPorts := make(map[int32]struct{})
 
-	for _, passthroughServer := range conf.TLSPassthroughServers {
-		sharedTLSPorts[passthroughServer.Port] = struct{}{}
+	for _, tlsServer := range conf.TLSServers {
+		sharedTLSPorts[tlsServer.Port] = struct{}{}
 	}
 
 	for idx, s := range conf.HTTPServers {
 		serverID := fmt.Sprintf("%d", idx)
-		httpServer, matchPairs := createServer(s, serverID, generator, keepAliveCheck)
+		httpServer, matchPairs := createServer(
+			s,
+			serverID,
+			generator,
+			keepAliveCheck,
+			conf.BaseHTTPConfig.DisableBaseProxySetHeaders,
+		)
 		servers = append(servers, httpServer)
 		maps.Copy(finalMatchPairs, matchPairs)
 	}
@@ -155,7 +195,14 @@ func createServers(
 	for idx, s := range conf.SSLServers {
 		serverID := fmt.Sprintf("SSL_%d", idx)
 
-		sslServer, matchPairs := createSSLServer(s, serverID, generator, keepAliveCheck, disableSNI)
+		sslServer, matchPairs := createSSLServer(
+			s,
+			serverID,
+			generator,
+			keepAliveCheck,
+			disableSNI,
+			conf.BaseHTTPConfig.DisableBaseProxySetHeaders,
+		)
 		if _, portInUse := sharedTLSPorts[s.Port]; portInUse {
 			sslServer.Listen = getSocketNameHTTPS(s.Port)
 			sslServer.IsSocket = true
@@ -173,6 +220,7 @@ func createSSLServer(
 	generator policies.Generator,
 	keepAliveCheck keepAliveChecker,
 	disableSNIHostValidation bool,
+	disableBaseProxySetHeaders []string,
 ) (http.Server, httpMatchPairs) {
 	listen := fmt.Sprint(virtualServer.Port)
 	if virtualServer.IsDefault {
@@ -187,7 +235,13 @@ func createSSLServer(
 		return server, nil
 	}
 
-	locs, matchPairs, grpc := createLocations(&virtualServer, serverID, generator, keepAliveCheck)
+	locs, matchPairs, grpc := createLocations(
+		&virtualServer,
+		serverID,
+		generator,
+		keepAliveCheck,
+		disableBaseProxySetHeaders,
+	)
 
 	server := http.Server{
 		ServerName: virtualServer.Hostname,
@@ -253,6 +307,7 @@ func createServer(
 	serverID string,
 	generator policies.Generator,
 	keepAliveCheck keepAliveChecker,
+	disableBaseProxySetHeaders []string,
 ) (http.Server, httpMatchPairs) {
 	listen := fmt.Sprint(virtualServer.Port)
 
@@ -263,7 +318,13 @@ func createServer(
 		}, nil
 	}
 
-	locs, matchPairs, grpc := createLocations(&virtualServer, serverID, generator, keepAliveCheck)
+	locs, matchPairs, grpc := createLocations(
+		&virtualServer,
+		serverID,
+		generator,
+		keepAliveCheck,
+		disableBaseProxySetHeaders,
+	)
 
 	server := http.Server{
 		ServerName: virtualServer.Hostname,
@@ -470,6 +531,7 @@ func createLocations(
 	serverID string,
 	generator policies.Generator,
 	keepAliveCheck keepAliveChecker,
+	disableBaseProxySetHeaders []string,
 ) ([]http.Location, httpMatchPairs, bool) {
 	maxLocs, pathsAndTypes := getMaxLocationCountAndPathMap(server.PathRules)
 	locs := make([]http.Location, 0, maxLocs)
@@ -506,6 +568,7 @@ func createLocations(
 				extLocations,
 				server.Port,
 				keepAliveCheck,
+				disableBaseProxySetHeaders,
 				mirrorPercentage)...,
 			)
 		case needsInternalLocationsForMatches(rule):
@@ -516,6 +579,7 @@ func createLocations(
 				generator,
 				server.Port,
 				keepAliveCheck,
+				disableBaseProxySetHeaders,
 				mirrorPercentage,
 			)
 			httpMatchKey := serverID + "_" + strconv.Itoa(pathRuleIdx)
@@ -537,6 +601,7 @@ func createLocations(
 				generator,
 				server.Port,
 				keepAliveCheck,
+				disableBaseProxySetHeaders,
 				mirrorPercentage)...,
 			)
 		}
@@ -551,6 +616,9 @@ func createLocations(
 	// Add internal JWKS locations for remote JWT authentication
 	locs = append(locs, extractUniqueJWKSLocations(locs)...)
 
+	// Add internal auth_request locations for ExternalAuth filters
+	locs = append(locs, extractExternalAuthInternalLocations(locs)...)
+
 	return locs, matchPairs, grpcServer
 }
 
@@ -561,6 +629,7 @@ func updateExternalLocationsForRule(
 	extLocations []http.Location,
 	port int32,
 	keepAliveCheck keepAliveChecker,
+	disableBaseProxySetHeaders []string,
 	mirrorPercentage *float64,
 ) []http.Location {
 	for matchRuleIndex, r := range rule.MatchRules {
@@ -573,6 +642,7 @@ func updateExternalLocationsForRule(
 			extLocations,
 			port,
 			keepAliveCheck,
+			disableBaseProxySetHeaders,
 			mirrorPercentage,
 		)
 	}
@@ -587,6 +657,7 @@ func createInternalLocationsForRule(
 	generator policies.Generator,
 	port int32,
 	keepAliveCheck keepAliveChecker,
+	disableBaseProxySetHeaders []string,
 	mirrorPercentage *float64,
 ) ([]http.Location, []routeMatch) {
 	// Calculate the exact capacity needed
@@ -627,6 +698,7 @@ func createInternalLocationsForRule(
 				intLocation,
 				port,
 				keepAliveCheck,
+				disableBaseProxySetHeaders,
 				mirrorPercentage,
 				serverID,
 				matchRuleIdx,
@@ -680,6 +752,7 @@ func createInternalLocationsForRule(
 					intProxyPassLocation,
 					port,
 					keepAliveCheck,
+					disableBaseProxySetHeaders,
 					mirrorPercentage,
 					serverID,
 					matchRuleIdx,
@@ -754,6 +827,7 @@ func createInferenceLocationsForRule(
 	generator policies.Generator,
 	port int32,
 	keepAliveCheck keepAliveChecker,
+	disableBaseProxySetHeaders []string,
 	mirrorPercentage *float64,
 ) []http.Location {
 	capacity := len(extLocations)
@@ -825,6 +899,7 @@ func createInferenceLocationsForRule(
 				intProxyPassLocation,
 				port,
 				keepAliveCheck,
+				disableBaseProxySetHeaders,
 				mirrorPercentage,
 				serverID,
 				matchRuleIdx,
@@ -1121,6 +1196,7 @@ func updateLocation(
 	location http.Location,
 	listenerPort int32,
 	keepAliveCheck keepAliveChecker,
+	disableBaseProxySetHeaders []string,
 	mirrorPercentage *float64,
 	serverID string,
 	matchRuleIndex int,
@@ -1138,6 +1214,7 @@ func updateLocation(
 	location = updateLocationMirrorRoute(location, pathRule.Path, grpc)
 	location.Includes = append(location.Includes, createIncludesFromLocationSnippetsFilters(filters.SnippetsFilters)...)
 	location = updateLocationAuthenticationFilter(location, filters.AuthenticationFilter)
+	location = updateLocationExternalAuthFilter(location, filters.ExternalAuthFilter)
 	location = updateLocationCORSFilter(location, filters.CORSFilter, serverID, pathRuleIndex, matchRuleIndex)
 
 	if filters.RequestRedirect != nil {
@@ -1146,7 +1223,14 @@ func updateLocation(
 
 	location = updateLocationRewriteFilter(location, filters.RequestURLRewrite, pathRule)
 	location = updateLocationMirrorFilters(location, filters.RequestMirrors, pathRule.Path, mirrorPercentage)
-	location = updateLocationProxySettings(location, matchRule, grpc, inferenceBackend, keepAliveCheck)
+	location = updateLocationProxySettings(
+		location,
+		matchRule,
+		grpc,
+		inferenceBackend,
+		keepAliveCheck,
+		disableBaseProxySetHeaders,
+	)
 
 	return location
 }
@@ -1171,42 +1255,166 @@ func updateLocationAuthenticationFilter(
 	}
 
 	if authenticationFilter.JWT != nil {
-		jwt := &http.AuthJWT{
-			Realm:    authenticationFilter.JWT.Realm,
-			KeyCache: authenticationFilter.JWT.KeyCache,
-		}
-
-		if authenticationFilter.JWT.Remote != nil {
-			remote := &http.AuthJWTRemote{
-				URI:  authenticationFilter.JWT.Remote.URI,
-				Path: authenticationFilter.JWT.Remote.Path,
-			}
-
-			if authenticationFilter.JWT.Remote.CACertBundlePath != "" {
-				remote.TrustedCertificate = generateCertBundleFileName(
-					authenticationFilter.JWT.Remote.CACertBundlePath,
-				)
-			} else {
-				remote.TrustedCertificate = dataplane.AlpineSSLRootCAPath
-			}
-
-			jwt.Remote = remote
-		} else {
-			id := dataplane.GenerateAuthJWTFileID(
-				authenticationFilter.JWT.SecretNamespace,
-				authenticationFilter.JWT.SecretName,
-			)
-			jwt.File = generateAuthFileName(id)
-		}
-
-		location.AuthJWT = jwt
+		location.AuthJWT = getAuthJWTLocationConfig(authenticationFilter.JWT)
 	}
 
-	if authenticationFilter.OIDC != nil {
-		location.AuthOIDCProviderName = authenticationFilter.OIDC.Name
+	if authenticationFilter.OIDC != nil && authenticationFilter.OIDC.Provider != nil {
+		location.AuthOIDC = getAuthOIDCLocationConfig(authenticationFilter.OIDC)
 	}
 
 	return location
+}
+
+// getAuthJWTLocationConfig returns the AuthJWT configuration for a given JWT authentication filter.
+// It handles both remote and local JWT configurations.
+func getAuthJWTLocationConfig(jwtAuthFilter *dataplane.AuthJWT) *http.AuthJWT {
+	jwt := &http.AuthJWT{
+		Realm:    jwtAuthFilter.Realm,
+		KeyCache: jwtAuthFilter.KeyCache,
+		Leeway:   jwtAuthFilter.Leeway,
+	}
+
+	if jwtAuthFilter.Remote != nil {
+		remote := &http.AuthJWTRemote{
+			URI:  jwtAuthFilter.Remote.URI,
+			Path: jwtAuthFilter.Remote.Path,
+		}
+
+		if jwtAuthFilter.Remote.CACertBundlePath != "" {
+			remote.TrustedCertificate = generateCertBundleFileName(
+				jwtAuthFilter.Remote.CACertBundlePath,
+			)
+		} else {
+			remote.TrustedCertificate = dataplane.AlpineSSLRootCAPath
+		}
+
+		jwt.Remote = remote
+	} else {
+		id := dataplane.GenerateAuthJWTFileID(
+			jwtAuthFilter.SecretNamespace,
+			jwtAuthFilter.SecretName,
+		)
+		jwt.File = generateAuthFileName(id)
+	}
+
+	if jwtAuthFilter.AuthRequireVariable != "" {
+		jwt.AuthZConfig = &http.AuthZConfig{
+			AuthRequire: jwtAuthFilter.AuthRequireVariable,
+		}
+	}
+	if len(jwtAuthFilter.AuthZProxySetHeaders) > 0 {
+		proxySetHeaders := make([]http.Header, 0, len(jwtAuthFilter.AuthZProxySetHeaders))
+		for _, psh := range jwtAuthFilter.AuthZProxySetHeaders {
+			proxySetHeaders = append(proxySetHeaders, http.Header{
+				Name:  psh.Name,
+				Value: psh.Value,
+			})
+		}
+		if jwt.AuthZConfig == nil {
+			jwt.AuthZConfig = &http.AuthZConfig{}
+		}
+		jwt.AuthZConfig.ProxySetHeaders = proxySetHeaders
+	}
+	return jwt
+}
+
+// getAuthOIDCLocationConfig returns the AuthOIDC configuration for a given OIDC authentication filter.
+func getAuthOIDCLocationConfig(oidcAuthFilter *dataplane.AuthOIDC) *http.AuthOIDC {
+	oidc := &http.AuthOIDC{
+		ProviderName: oidcAuthFilter.Provider.Name,
+	}
+
+	// If OIDC has authorization config, add auth_jwt for ID token claim validation
+	if oidcAuthFilter.AuthRequireVariable != "" {
+		oidc.AuthZConfig = &http.AuthZConfig{
+			AuthRequire: oidcAuthFilter.AuthRequireVariable,
+		}
+	}
+	if len(oidcAuthFilter.AuthZProxySetHeaders) > 0 {
+		proxySetHeaders := make([]http.Header, 0, len(oidcAuthFilter.AuthZProxySetHeaders))
+		for _, psh := range oidcAuthFilter.AuthZProxySetHeaders {
+			proxySetHeaders = append(proxySetHeaders, http.Header{
+				Name:  psh.Name,
+				Value: psh.Value,
+			})
+		}
+		if oidc.AuthZConfig == nil {
+			oidc.AuthZConfig = &http.AuthZConfig{}
+		}
+		oidc.AuthZConfig.ProxySetHeaders = proxySetHeaders
+	}
+	return oidc
+}
+
+func updateLocationExternalAuthFilter(
+	location http.Location,
+	f *dataplane.HTTPExternalAuthFilter,
+) http.Location {
+	if f == nil {
+		return location
+	}
+	location.AuthExternalRequest = &http.AuthExternalRequest{
+		InternalPath:           f.InternalPath,
+		UpstreamName:           f.UpstreamName,
+		PathPrefix:             f.PathPrefix,
+		AllowedRequestHeaders:  f.AllowedRequestHeaders,
+		AllowedResponseHeaders: f.AllowedResponseHeaders,
+		ForwardBody:            f.ForwardBody,
+		ProxySSLVerify:         createProxySSLVerify(f.VerifyTLS),
+	}
+	if f.MaxBodySize > 0 {
+		location.ClientMaxBodySize = f.MaxBodySize
+	}
+	return location
+}
+
+// extractExternalAuthInternalLocations extracts unique internal auth_request locations from a list of locations.
+func extractExternalAuthInternalLocations(locations []http.Location) []http.Location {
+	seen := make(map[string]struct{})
+	var result []http.Location
+
+	for _, loc := range locations {
+		if loc.AuthExternalRequest == nil {
+			continue
+		}
+		path := loc.AuthExternalRequest.InternalPath
+		if _, exists := seen[path]; exists {
+			continue
+		}
+		seen[path] = struct{}{}
+
+		ar := loc.AuthExternalRequest
+		proxyPass := generateProtocolString(ar.ProxySSLVerify, false) + "://" + ar.UpstreamName
+		if ar.PathPrefix != "" {
+			proxyPass += ar.PathPrefix
+		}
+
+		headers := []http.Header{
+			{Name: "Host", Value: "$gw_api_compliant_host"},
+			{Name: extAuthPathHeader, Value: extAuthPathValue},
+			{Name: extAuthMethodHeader, Value: extAuthMethodValue},
+			{Name: extAuthAuthorizationHeader, Value: extAuthAuthorizationValue},
+		}
+		for _, h := range ar.AllowedRequestHeaders {
+			headers = append(headers, http.Header{Name: h, Value: httpHeaderVarPrefix + headerToNginxVar(h)})
+		}
+
+		var proxyPassBody string
+		if !ar.ForwardBody {
+			proxyPassBody = proxyPassRequestBodyOff
+		}
+		authLoc := http.Location{
+			Path:                    path,
+			Type:                    http.InternalLocationType,
+			ProxyPass:               proxyPass,
+			ProxySetHeaders:         headers,
+			ProxySSLVerify:          ar.ProxySSLVerify,
+			ProxyPassRequestBody:    proxyPassBody,
+			ProxyPassRequestHeaders: proxyPassRequestHeadersOff,
+		}
+		result = append(result, authLoc)
+	}
+	return result
 }
 
 func updateLocationCORSFilter(
@@ -1337,11 +1545,17 @@ func updateLocationProxySettings(
 	grpc bool,
 	inferenceBackend bool,
 	keepAliveCheck keepAliveChecker,
+	disableBaseProxySetHeaders []string,
 ) http.Location {
+	location.ProxyHTTPVersion = resolveProxyHTTPVersion(matchRule.BackendGroup.Backends, grpc)
+
 	extraHeaders := make([]http.Header, 0, 3)
-	if grpc {
+
+	switch {
+	case location.ProxyHTTPVersion == "2":
+	case grpc:
 		extraHeaders = append(extraHeaders, grpcAuthorityHeader)
-	} else {
+	default:
 		extraHeaders = append(extraHeaders, httpUpgradeHeader)
 		extraHeaders = append(extraHeaders, getConnectionHeader(keepAliveCheck, matchRule.BackendGroup.Backends))
 	}
@@ -1355,9 +1569,12 @@ func updateLocationProxySettings(
 		}
 	}
 
+	baseProxySetHeaders := createBaseProxySetHeaders(externalHostname, extraHeaders...)
+	baseProxySetHeaders = filterBaseProxySetHeaders(baseProxySetHeaders, disableBaseProxySetHeaders)
+
 	proxySetHeaders := generateProxySetHeaders(
 		&matchRule.Filters,
-		createBaseProxySetHeaders(externalHostname, extraHeaders...),
+		baseProxySetHeaders,
 	)
 	responseHeaders := generateResponseHeaders(&matchRule.Filters)
 
@@ -1379,6 +1596,38 @@ func updateLocationProxySettings(
 	return location
 }
 
+// resolveProxyHTTPVersion decides whether to emit a proxy_http_version directive for a location.
+// The directive is only written when the value differs from NGINX's default (1.1).
+//
+// Priority:
+//  1. All valid backends carry appProtocol kubernetes.io/h2c → return "2".
+//  2. Otherwise → return "" (omit directive; NGINX default of 1.1 applies).
+//
+// h2c detection is skipped for gRPC locations because grpc_pass handles HTTP/2 internally.
+func resolveProxyHTTPVersion(backends []dataplane.Backend, grpc bool) string {
+	if !grpc && allValidBackendsAreH2C(backends) {
+		return "2"
+	}
+
+	return ""
+}
+
+// allValidBackendsAreH2C returns true when at least one valid backend exists and every
+// valid backend has AppProtocol kubernetes.io/h2c.
+func allValidBackendsAreH2C(backends []dataplane.Backend) bool {
+	hasValid := false
+	for _, b := range backends {
+		if !b.Valid {
+			continue
+		}
+		if b.AppProtocol != graph.AppProtocolTypeH2C {
+			return false
+		}
+		hasValid = true
+	}
+	return hasValid
+}
+
 // updateLocations updates the existing locations with any relevant configurations, like proxy_pass,
 // filters, tls settings, etc.
 func updateLocations(
@@ -1390,6 +1639,7 @@ func updateLocations(
 	buildLocations []http.Location,
 	listenerPort int32,
 	keepAliveCheck keepAliveChecker,
+	disableBaseProxySetHeaders []string,
 	mirrorPercentage *float64,
 ) []http.Location {
 	updatedLocations := make([]http.Location, len(buildLocations))
@@ -1401,6 +1651,7 @@ func updateLocations(
 			loc,
 			listenerPort,
 			keepAliveCheck,
+			disableBaseProxySetHeaders,
 			mirrorPercentage,
 			serverID,
 			matchRuleIdx,
@@ -1858,10 +2109,12 @@ func findOIDCProviders(pathRules []dataplane.PathRule) []*dataplane.OIDCProvider
 	var providers []*dataplane.OIDCProvider
 	for _, rule := range pathRules {
 		for _, matchRule := range rule.MatchRules {
-			if matchRule.Filters.AuthenticationFilter == nil || matchRule.Filters.AuthenticationFilter.OIDC == nil {
+			if matchRule.Filters.AuthenticationFilter == nil ||
+				matchRule.Filters.AuthenticationFilter.OIDC == nil ||
+				matchRule.Filters.AuthenticationFilter.OIDC.Provider == nil {
 				continue
 			}
-			provider := matchRule.Filters.AuthenticationFilter.OIDC
+			provider := matchRule.Filters.AuthenticationFilter.OIDC.Provider
 			if _, exists := seen[provider.Name]; !exists {
 				seen[provider.Name] = struct{}{}
 				providers = append(providers, provider)
@@ -1921,9 +2174,11 @@ func existingExactPathSet(pathRules []dataplane.PathRule) map[string]struct{} {
 // This is created for path-only URIs: redirectURI, logoutURI, or frontChannelLogoutURI.
 func createOIDCCallbackLocation(provider *dataplane.OIDCProvider, path string) http.Location {
 	return http.Location{
-		Path:                 "= " + path,
-		Type:                 http.ExternalLocationType,
-		AuthOIDCProviderName: provider.Name,
+		Path: "= " + path,
+		Type: http.ExternalLocationType,
+		AuthOIDC: &http.AuthOIDC{
+			ProviderName: provider.Name,
+		},
 	}
 }
 
@@ -1961,23 +2216,23 @@ func createBaseProxySetHeaders(externalHostname string, extraHeaders ...http.Hea
 			Value: hostValue,
 		},
 		{
-			Name:  "X-Forwarded-For",
+			Name:  string(v1alpha2.HeaderXForwardedFor),
 			Value: "$proxy_add_x_forwarded_for",
 		},
 		{
-			Name:  "X-Real-IP",
+			Name:  string(v1alpha2.HeaderXRealIP),
 			Value: "$remote_addr",
 		},
 		{
-			Name:  "X-Forwarded-Proto",
+			Name:  string(v1alpha2.HeaderXForwardedProto),
 			Value: "$scheme",
 		},
 		{
-			Name:  "X-Forwarded-Host",
+			Name:  string(v1alpha2.HeaderXForwardedHost),
 			Value: "$host",
 		},
 		{
-			Name:  "X-Forwarded-Port",
+			Name:  string(v1alpha2.HeaderXForwardedPort),
 			Value: "$server_port",
 		},
 	}
@@ -1985,6 +2240,37 @@ func createBaseProxySetHeaders(externalHostname string, extraHeaders ...http.Hea
 	baseHeaders = append(baseHeaders, extraHeaders...)
 
 	return baseHeaders
+}
+
+// filterBaseProxySetHeaders removes any headers from the base proxy set headers that are
+// specified in the disableBaseProxySetHeaders list.
+func filterBaseProxySetHeaders(baseHeaders []http.Header, disableBaseProxySetHeaders []string) []http.Header {
+	if len(disableBaseProxySetHeaders) == 0 {
+		return baseHeaders
+	}
+
+	disabledHeaders := make(map[string]struct{}, len(disableBaseProxySetHeaders))
+	for _, header := range disableBaseProxySetHeaders {
+		if header == "*" {
+			disabledHeaders[string(v1alpha2.HeaderXForwardedFor)] = struct{}{}
+			disabledHeaders[string(v1alpha2.HeaderXForwardedProto)] = struct{}{}
+			disabledHeaders[string(v1alpha2.HeaderXForwardedHost)] = struct{}{}
+			disabledHeaders[string(v1alpha2.HeaderXForwardedPort)] = struct{}{}
+			disabledHeaders[string(v1alpha2.HeaderXRealIP)] = struct{}{}
+			continue
+		}
+		disabledHeaders[header] = struct{}{}
+	}
+
+	filteredHeaders := make([]http.Header, 0, len(baseHeaders))
+	for _, header := range baseHeaders {
+		if _, disabled := disabledHeaders[header.Name]; disabled {
+			continue
+		}
+		filteredHeaders = append(filteredHeaders, header)
+	}
+
+	return filteredHeaders
 }
 
 func getConnectionHeader(keepAliveCheck keepAliveChecker, backends []dataplane.Backend) http.Header {
